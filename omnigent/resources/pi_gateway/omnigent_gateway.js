@@ -71,8 +71,8 @@ function normalizeEvent(frame, state) {
         state.calls.set(key, entry);
       }
       if (call.id && !entry.id) {
-        // The gateway reuses function names as IDs across distinct tool calls.
-        entry.id = call.id === call.function?.name ? `call_${randomUUID()}` : call.id;
+        // Gateway IDs can repeat, and function names may arrive in a later delta.
+        entry.id = `call_${randomUUID()}`;
       }
       if (call.id && entry.id) call.id = entry.id;
       const signature = call.thoughtSignature || call.extra_content?.google?.thought_signature;

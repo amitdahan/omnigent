@@ -38,8 +38,10 @@ def test_gateway_extension_only_overlays_its_chat_transport(
     assert "secret" not in "".join(p.read_text() for p in tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("metadata_shape", ["together", "split"])
 def test_gateway_stream_handles_fragmented_metadata_and_preserves_callbacks(
     tmp_path: Path,
+    metadata_shape: str,
 ) -> None:
     node = shutil.which("node")
     if node is None:
@@ -65,7 +67,12 @@ def test_gateway_stream_handles_fragmented_metadata_and_preserves_callbacks(
     module = tmp_path / "adapter.mjs"
     module.write_text(source)
     result = subprocess.run(
-        [node, str(Path(__file__).with_name("pi_gateway_protocol.mjs")), str(module)],
+        [
+            node,
+            str(Path(__file__).with_name("pi_gateway_protocol.mjs")),
+            str(module),
+            metadata_shape,
+        ],
         capture_output=True,
         text=True,
         timeout=30,

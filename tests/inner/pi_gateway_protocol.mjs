@@ -67,6 +67,19 @@ const frames = [
   },
   { choices: [], usage: { total_tokens: 7 } },
 ];
+const splitMetadata = process.argv[3] === "split";
+if (splitMetadata) {
+  const calls = frames[0].choices[0].delta.tool_calls;
+  const delayedNames = calls.map(({ index, id, function: fn }) => ({
+    index,
+    id,
+    function: fn,
+  }));
+  for (const call of calls) delete call.function;
+  frames.splice(1, 0, {
+    choices: [{ index: 0, delta: { tool_calls: delayedNames } }],
+  });
+}
 const wire =
   ": comment\r\n\r\n" +
   frames.map((frame) => "data: " + JSON.stringify(frame) + "\r\n\r\n").join("") +
@@ -119,7 +132,7 @@ function provider(_model, _context, options) {
         ...delta.tool_calls.map((call) => ({
           type: "toolCall",
           id: call.id,
-          name: call.function.name,
+          name: "echo",
           arguments: {},
         })),
       ],
@@ -157,8 +170,14 @@ assert.deepEqual(
 const ids = result.content.slice(1).map((call) => call.id);
 assert.equal(new Set(ids).size, 2);
 assert.ok(ids.every((id) => id !== "echo"));
-assert.equal(observed[1].choices[0].delta.tool_calls[0].id, undefined);
-assert.deepEqual(observed[2], frames[2]);
+const namedCalls = observed[splitMetadata ? 1 : 0].choices[0].delta.tool_calls;
+assert.deepEqual(
+  namedCalls.map((call) => call.function.name),
+  ["echo", "echo"],
+);
+assert.deepEqual(namedCalls.map((call) => call.id), ids);
+assert.equal(observed.at(-2).choices[0].delta.tool_calls[0].id, undefined);
+assert.deepEqual(observed.at(-1), frames.at(-1));
 
 const errorResponse = new Response("provider error", { status: 429 });
 let options;
