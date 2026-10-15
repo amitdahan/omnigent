@@ -33,5 +33,7 @@ def pi_gateway_extension_args(agent_dir: Path, models_config: Mapping[str, objec
         files("omnigent.resources.pi_gateway").joinpath(extension.name).read_text(),
         encoding="utf-8",
     )
-    (agent_dir / "omnigent_gateway_providers.json").write_text(json.dumps(providers))
+    (agent_dir / "omnigent_gateway_providers.json").write_text(
+        json.dumps(providers), encoding="utf-8"
+    )
     return ["--extension", str(extension)]

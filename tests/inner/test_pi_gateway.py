@@ -60,6 +60,7 @@ def test_gateway_stream_handles_fragmented_metadata_and_preserves_callbacks(
         'from "@earendil-works/pi-ai"',
         'from "data:text/javascript,export const streamSimpleOpenAICompletions = () => {}"',
     )
+    assert "@earendil-works/pi-ai" not in source, "Pi import stub no longer matches the extension"
     # Pi supplies this dependency via its extension loader; process tests cover it.
     module = tmp_path / "adapter.mjs"
     module.write_text(source)

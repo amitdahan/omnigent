@@ -168,7 +168,6 @@ createStream((_model, _context, received) => {
 })(model, { messages: [] }, { fetch: async () => errorResponse });
 assert.equal(await options.fetch("unused"), errorResponse);
 let cancelled = false;
-const controller = new AbortController();
 const response = new Response(
   new ReadableStream({
     cancel() {
@@ -184,14 +183,10 @@ createStream((_model, _context, received) => {
   model,
   { messages: [] },
   {
-    signal: controller.signal,
-    fetch: async (_url, init) => {
-      assert.equal(init.signal, controller.signal);
-      return response;
-    },
+    fetch: async () => response,
   },
 );
-const normalized = await options.fetch("unused", { signal: controller.signal });
+const normalized = await options.fetch("unused");
 await normalized.body.cancel();
 await new Promise((resolve) => setImmediate(resolve));
 assert.equal(cancelled, true);

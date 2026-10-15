@@ -71,6 +71,7 @@ function normalizeEvent(frame, state) {
         state.calls.set(key, entry);
       }
       if (call.id && !entry.id) {
+        // The gateway reuses function names as IDs across distinct tool calls.
         entry.id = call.id === call.function?.name ? `call_${randomUUID()}` : call.id;
       }
       if (call.id && entry.id) call.id = entry.id;

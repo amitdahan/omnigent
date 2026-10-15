@@ -238,6 +238,7 @@ def test_generic_provider_delivers_effort_through_native_tool_turn(
         lambda _: [ModelInfo(name=model, provider="openai", supports_reasoning=True)],
     )
     gateway_chat = databricks and wire_api == "chat"
+    # The gateway deliberately repeats the tool name as its call ID across turns.
     tool = {
         "call_id": "bash" if gateway_chat else "effort-tool",
         "name": "bash",

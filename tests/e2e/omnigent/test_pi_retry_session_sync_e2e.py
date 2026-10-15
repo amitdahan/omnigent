@@ -208,6 +208,7 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         lambda _: [ModelInfo(name=mock_model, provider="openai", supports_reasoning=True)],
     )
     gateway_chat = databricks and wire_api == "chat"
+    # The gateway deliberately repeats the tool name as its call ID across turns.
     tool = {
         "call_id": "remember" if gateway_chat else "remember-1",
         "name": "remember",
