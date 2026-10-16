@@ -2575,10 +2575,9 @@ class _TranscriptSpawnIdCacheEntry:
     tool_use_ids: frozenset[str]
 
 
-# Spawn-id correlation memo keyed by transcript path. An unregistered meta
-# re-runs correlation every poll, so unchanged transcripts must not be
-# re-parsed each time. Shared by every session's forwarder thread, hence the
-# lock; least recently used entries age out past the cap.
+# Spawn-id memo keyed by transcript path: an unregistered meta re-runs
+# correlation every poll, so unchanged files must not be re-parsed. Shared by
+# every session's forwarder thread (hence the lock); LRU entries age out.
 _SPAWN_TOOL_USE_ID_CACHE: dict[Path, _TranscriptSpawnIdCacheEntry] = {}
 _SPAWN_TOOL_USE_ID_CACHE_LOCK = threading.Lock()
 _SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES = 1024

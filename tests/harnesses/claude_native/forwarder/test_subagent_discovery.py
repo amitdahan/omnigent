@@ -837,6 +837,7 @@ def _process_read_bytes() -> int | None:
 
 async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A meta whose spawn never resolves must not make every poll re-read all transcripts.
 
@@ -847,6 +848,7 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
     """
     if _process_read_bytes() is None:
         pytest.skip("requires /proc/self/io read accounting")
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -877,7 +879,7 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
     def response_for(item: dict[str, Any]) -> dict[str, Any]:
         if item.get("type") == "external_subagent_start":
             return {"queued": False, "child_session_id": "conv_finished"}
-        return {}
+        return {"item_id": "ack"}
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_batch_safe_handler(response_for)),
@@ -918,6 +920,7 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
 async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
     tmp_path: Path,
     spawn_owner: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A spawn record appended after idle polls still resolves its waiting meta.
 
@@ -926,6 +929,7 @@ async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
     the root transcript or a helper's sidechain transcript, and register the
     sub-agent under the owner that issued the spawn.
     """
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -950,7 +954,7 @@ async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
 
     def response_for(item: dict[str, Any]) -> dict[str, Any]:
         if item.get("type") != "external_subagent_start":
-            return {}
+            return {"item_id": "ack"}
         return {"queued": False, "child_session_id": f"conv_{item['data']['subagent_id']}"}
 
     async with httpx.AsyncClient(
