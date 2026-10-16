@@ -164,6 +164,11 @@ the bundle:
   `instructions:`, and `context_files: false` disables it; an `AGENTS.md` the
   spec already adopted as the agent's instructions is unaffected by that option.
 
+Under an `os_env` sandbox, Pi is granted read-only access to the `skills/`,
+`.pi/skills/` and `.pi/extensions/` directories it is passed, so bundled
+resources load from inside the sandbox too; the bundle root itself is not
+exposed.
+
 ### Pi system prompt
 
 With `harness: pi`, `system_prompt_mode` controls how Omnigent sends its composed

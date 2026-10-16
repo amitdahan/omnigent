@@ -4854,17 +4854,40 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     assert "FAKE_HOST_SECRET" not in allowlist
 
 
-def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_path, caplog) -> None:
-    """The bundle dir is not added as a sandbox read root.
+def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
+    """Only the bundle roots that contributed a ``--skill`` / ``--extension``
+    path are granted, in a stable order; no bundle or no resources grants
+    nothing.
+    """
+    from omnigent.inner.pi_executor import _pi_bundle_resource_roots
 
-    The runner extracts bundles under the temp dir, which the pi sandbox
-    already binds, and a read root would subject the bundle's top level to
-    the dotfile mask and hide its ``.pi/`` resources from pi. A bundle
-    outside those grants is reported so the gap is not silent.
+    bundle = tmp_path / "bundle"
+    args = [
+        "--no-tools",
+        "--skill",
+        str(bundle / ".pi" / "skills" / "grilling"),
+        "--extension",
+        str(bundle / ".pi" / "extensions" / "ext" / "index.js"),
+    ]
+
+    assert _pi_bundle_resource_roots(bundle, args) == [
+        bundle / ".pi" / "skills",
+        bundle / ".pi" / "extensions",
+    ]
+    assert _pi_bundle_resource_roots(bundle, ["--no-tools"]) == []
+    assert _pi_bundle_resource_roots(None, args) == []
+
+
+def test_pi_sandbox_grants_bundle_resource_dirs_as_read_roots(monkeypatch, tmp_path) -> None:
+    """A sandboxed Pi is granted the bundle resource directories it is passed.
+
+    The runner extracts bundles under the host temp dir, which the sandbox
+    replaces with a private tmpfs, so without these grants Pi aborts on its
+    ``--extension`` path. The bundle root itself stays ungranted: the dotfile
+    mask would hide its ``.pi/`` entry.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Pytest tmp dir hosting both the cwd and the bundle.
-    :param caplog: Pytest log capture fixture.
     """
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -4880,7 +4903,7 @@ def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_pat
         return SandboxPolicy(
             backend_type="linux_bwrap",
             active=True,
-            read_roots=[cwd.resolve(strict=False)],
+            read_roots=None,
             write_roots=[cwd.resolve(strict=False)],
             write_files=[],
             allow_network=False,
@@ -4892,89 +4915,37 @@ def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_pat
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     bundle = tmp_path / "bundle"
-    bundle.mkdir()
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
-        executor = PiExecutor(
-            cwd=str(workspace),
-            bundle_dir=bundle,
-            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
-        )
+    flat_skills = bundle / "skills"
+    pi_skills = bundle / ".pi" / "skills"
+    extensions = bundle / ".pi" / "extensions"
+    _make_pi_skill_dir(flat_skills, "alpha")
+    _make_pi_skill_dir(pi_skills, "grilling")
+    (extensions / "ext").mkdir(parents=True)
+    (extensions / "ext" / "index.js").write_text("module.exports = function () {};\n")
+    (bundle / "AGENTS.md").write_text("Bundle guidance.\n")
 
-    assert executor._sandboxed is True
-    policy = captured["policy"]
-    assert bundle.resolve() not in (policy.read_roots or [])
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    assert temp_root in [root.resolve(strict=False) for root in policy.write_roots]
-    # The temp dir is exempt from the dotfile mask scan, so a recursive scan
-    # cannot hide an extracted bundle's .pi/ either.
-    assert temp_root in [root.resolve(strict=False) for root in policy.mask_scan_skip_roots or []]
-    assert "may be hidden" not in caplog.text
+    def _granted_read_roots(skills_filter: str = "all") -> list[Path]:
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            executor = PiExecutor(
+                cwd=str(workspace),
+                bundle_dir=bundle,
+                os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+                skills_filter=skills_filter,
+            )
+        assert executor._sandboxed is True
+        return [root.resolve(strict=False) for root in captured["policy"].read_roots or []]
 
-    # A bundle outside every granted root is still spawned, but the gap is logged.
-    with (
-        caplog.at_level(logging.WARNING),
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
-    ):
-        PiExecutor(
-            cwd=str(workspace),
-            bundle_dir=Path("/opt/omnigent-bundles/outside"),
-            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
-        )
-    assert "may be hidden" in caplog.text
+    granted = _granted_read_roots()
+    assert flat_skills.resolve() in granted
+    assert pi_skills.resolve() in granted
+    assert extensions.resolve() in granted
+    assert bundle.resolve() not in granted
 
-
-@pytest.mark.parametrize(
-    ("read_roots", "recursive", "bundle", "visible"),
-    [
-        ("cwd", False, "cwd/vendored-bundle", True),
-        ("cwd", True, "cwd/vendored-bundle", False),
-        ("cwd", False, "cwd", False),
-        (None, False, "/opt/omnigent-bundles/outside", True),
-        ("cwd", False, "/opt/omnigent-bundles/outside", False),
-        ("cwd", True, "tmp", True),
-    ],
-    ids=[
-        "nested",
-        "nested-recursive-scan",
-        "bundle-is-cwd",
-        "unrestricted-reads",
-        "outside",
-        "temp-skip-root",
-    ],
-)
-def test_bundle_visible_in_sandbox_follows_policy(
-    tmp_path: Path, read_roots: str | None, recursive: bool, bundle: str, visible: bool
-) -> None:
-    """The visibility check behind the warning mirrors the mask scan: skip roots
-    are safe, unrestricted reads see everything, a bundle that is itself a
-    scanned root loses its ``.pi/``, and nested bundles survive unless the scan
-    recurses.
-    """
-    from omnigent.inner.pi_executor import _bundle_visible_in_sandbox
-    from omnigent.inner.sandbox import SandboxPolicy
-
-    cwd = tmp_path / "cwd"
-    cwd.mkdir()
-    # A dedicated skip root: the real temp dir may contain tmp_path itself.
-    skip_root = tmp_path / "scratch"
-    skip_root.mkdir()
-    policy = SandboxPolicy(
-        backend_type="linux_bwrap",
-        active=True,
-        read_roots=[cwd] if read_roots == "cwd" else None,
-        write_roots=[cwd, skip_root],
-        write_files=[],
-        allow_network=False,
-        cwd_hidden_scan_recursive=recursive,
-        mask_scan_skip_roots=[skip_root],
-    )
-    targets = {
-        "cwd": cwd,
-        "cwd/vendored-bundle": cwd / "vendored-bundle",
-        "tmp": skip_root / "runner-specs" / "bundle",
-    }
-    target = targets.get(bundle, Path(bundle))
-    assert _bundle_visible_in_sandbox(target, policy, cwd) is visible
+    # ``skills: none`` passes no --skill flags, so only the extensions root is granted.
+    granted = _granted_read_roots(skills_filter="none")
+    assert extensions.resolve() in granted
+    assert flat_skills.resolve() not in granted
+    assert pi_skills.resolve() not in granted
 
 
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:

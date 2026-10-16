@@ -37,6 +37,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -49,7 +50,7 @@ import tempfile
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
+from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent.harnesses.pi_native.credentials import (
@@ -100,9 +101,6 @@ from .executor import (
     ToolSpec,
     TurnComplete,
 )
-
-if TYPE_CHECKING:
-    from .sandbox import SandboxPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -1533,12 +1531,10 @@ class SandboxedPiCli:
         the original ``pi_path`` (sandbox skipped) or a generated wrapper
         script that applies the sandbox before exec-ing Pi.
     :param sandboxed: ``True`` when the wrapper script is active.
-    :param policy: The applied sandbox policy, or ``None`` without a sandbox.
     """
 
     launch_path: str
     sandboxed: bool
-    policy: SandboxPolicy | None = None
 
 
 def _try_sandbox_pi(
@@ -1546,6 +1542,7 @@ def _try_sandbox_pi(
     os_env: OSEnvSpec | None,
     cwd: str | None,
     spawn_env_names: Sequence[str] | None = None,
+    extra_read_roots: Sequence[pathlib.Path] | None = None,
 ) -> SandboxedPiCli:
     """Wrap the Pi CLI in a sandbox if ``os_env`` requests it.
 
@@ -1560,6 +1557,9 @@ def _try_sandbox_pi(
         anything else its environment picks up — defense in depth
         against host-env leakage into the sandbox. ``None`` skips the
         prune.
+    :param extra_read_roots: Directories granted read-only alongside Pi's
+        own installation, e.g. the bundle resource directories passed to
+        Pi via ``--skill`` / ``--extension``.
     """
     if os_env is None:
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
@@ -1587,41 +1587,16 @@ def _try_sandbox_pi(
             (parent for parent in executable.parents if parent.name == "node_modules"),
             executable.parent,
         )
-        sandbox = with_additional_read_roots(sandbox, [pi_dir])
+        sandbox = with_additional_read_roots(sandbox, [pi_dir, *(extra_read_roots or ())])
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
         launcher = create_exec_launcher(str(executable), sandbox)
-        return SandboxedPiCli(launch_path=launcher, sandboxed=True, policy=sandbox)
+        return SandboxedPiCli(launch_path=launcher, sandboxed=True)
     except (OSError, ImportError, NotImplementedError) as exc:
         logger.warning("Could not apply sandbox for Pi: %s", exc)
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-
-
-def _bundle_visible_in_sandbox(
-    bundle_dir: pathlib.Path, policy: SandboxPolicy, cwd: pathlib.Path
-) -> bool:
-    """Whether a sandboxed Pi can read *bundle_dir* with its ``.pi/`` intact.
-
-    Roots exempt from the dotfile mask scan are always safe. Otherwise the
-    bundle must be readable (reads unrestricted, or under a granted root) and
-    must not itself be a scanned root, whose top-level ``.pi/`` would be masked;
-    a nested bundle survives unless the scan recurses.
-    """
-    resolved = bundle_dir.resolve(strict=False)
-
-    def under(root: pathlib.Path) -> bool:
-        return resolved.is_relative_to(root.resolve(strict=False))
-
-    if any(under(root) for root in policy.mask_scan_skip_roots or ()):
-        return True
-    granted = [*(policy.read_roots or ()), *policy.write_roots]
-    if policy.read_roots is not None and not any(under(root) for root in granted):
-        return False
-    if any(resolved == root.resolve(strict=False) for root in (*granted, cwd)):
-        return False
-    return not policy.cwd_hidden_scan_recursive
 
 
 def _resolve_pi_skill_args(
@@ -1825,6 +1800,37 @@ def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[s
     for entry in _resolve_pi_bundle_extension_entries(extensions_dir):
         args.extend(["--extension", str(entry)])
     return args
+
+
+def _pi_bundle_resource_roots(
+    bundle_dir: pathlib.Path | None, args: Sequence[str]
+) -> list[pathlib.Path]:
+    """
+    Bundle directories a sandboxed Pi must read for the resources in *args*.
+
+    The runner extracts bundles under the host temp dir, which the sandbox
+    replaces with a private tmpfs, so each ``skills/``, ``.pi/skills/`` or
+    ``.pi/extensions/`` root that contributed a ``--skill`` / ``--extension``
+    path is granted read-only. The bundle root itself is never granted: the
+    dotfile mask would hide its ``.pi/`` entry.
+
+    :param bundle_dir: The agent bundle's extracted on-disk path, or ``None``.
+    :param args: The resolved Pi CLI tokens, e.g. ``self._extra_args``.
+    :returns: The resource roots to grant, in a stable order.
+    """
+    if bundle_dir is None:
+        return []
+    passed = {
+        pathlib.Path(value)
+        for flag, value in itertools.pairwise(args)
+        if flag in ("--skill", "--extension")
+    }
+    roots = (
+        bundle_dir / "skills",
+        bundle_dir / ".pi" / "skills",
+        bundle_dir / ".pi" / "extensions",
+    )
+    return [root for root in roots if any(path.is_relative_to(root) for path in passed)]
 
 
 def _squash_ws(text: str) -> str:
@@ -2073,7 +2079,9 @@ class PiExecutor(Executor):
             ``<bundle_dir>/.pi/extensions`` via ``--extension``, and a
             bundle-root context file (``AGENTS.md`` et al.) is appended
             to the composed system prompt when *context_files* allows.
-            ``None`` skips all bundle-resource wiring.
+            A sandboxed Pi is granted read access to the resource
+            directories it is passed. ``None`` skips all bundle-resource
+            wiring.
         :param agent_name: Optional agent display name. Reserved for
             future use; currently unused by Pi.
         :param skills_filter: Host-skill filter (``"all"`` / ``"none"``
@@ -2230,22 +2238,10 @@ class PiExecutor(Executor):
             os_env,
             cwd,
             spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
+            extra_read_roots=_pi_bundle_resource_roots(bundle_dir, self._extra_args),
         )
         self._pi_launch_path = sandboxed.launch_path
         self._sandboxed = sandboxed.sandboxed
-        if (
-            sandboxed.policy is not None
-            and bundle_dir is not None
-            and not _bundle_visible_in_sandbox(
-                bundle_dir, sandboxed.policy, pathlib.Path(cwd or os.getcwd())
-            )
-        ):
-            logger.warning(
-                "PiExecutor: bundle %s may be hidden from the sandboxed pi (outside the "
-                "granted roots or subject to the dotfile mask); bundled skills and "
-                "extensions may not load",
-                bundle_dir,
-            )
 
         self._session_states: dict[str, _PiSessionState] = {}
         self._tool_server: _ToolServer | None = None
