@@ -62,7 +62,7 @@ if args[:2] == ["pr", "view"]:
     finish(0, json.dumps({name: pr[name] for name in fields if name in pr}))
 if args[:2] == ["pr", "diff"]:
     finish(0, "")
-if args[:1] == ["api"] and re.fullmatch(
+if args[:1] == ["api"] and len(args) > 1 and re.fullmatch(
     f"repos/{re.escape(repo)}/commits/[0-9a-f]{{40}}/pulls", args[1]
 ):
     row = {"number": pr["number"], "state": "open", "html_url": pr["url"],
