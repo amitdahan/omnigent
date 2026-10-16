@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 from collections.abc import Callable
@@ -494,6 +495,21 @@ async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spaw
     assert "toolu_missing" in caplog.text
 
 
+def _batch_safe_handler(
+    response_for: Callable[[dict[str, Any]], dict[str, Any]],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Mock transport that answers single events and event-array batches alike."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        response = (
+            [response_for(item) for item in body] if isinstance(body, list) else response_for(body)
+        )
+        return httpx.Response(202, json=response)
+
+    return handler
+
+
 def _observe_subagent_scans(
     monkeypatch: pytest.MonkeyPatch,
     response_for: Callable[[dict[str, Any]], dict[str, Any]],
@@ -511,12 +527,7 @@ def _observe_subagent_scans(
             completed.set()
         return state
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content) if request.content else {}
-        response = (
-            [response_for(item) for item in body] if isinstance(body, list) else response_for(body)
-        )
-        return httpx.Response(202, json=response)
+    handler = _batch_safe_handler(response_for)
 
     @contextlib.asynccontextmanager
     async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
@@ -705,7 +716,7 @@ def _spawn_record(tool_use_id: str, description: str, *, sidechain: bool) -> dic
     return {
         "isSidechain": sidechain,
         "type": "assistant",
-        "uuid": f"inherited-spawn-{tool_use_id}",
+        "uuid": f"spawn-{tool_use_id}",
         "message": {
             "role": "assistant",
             "content": [
@@ -863,13 +874,13 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
     )
     transcript_bytes = transcript_path.stat().st_size + helper_path.stat().st_size
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if json.loads(request.content).get("type") == "external_subagent_start":
-            return httpx.Response(202, json={"queued": False, "child_session_id": "conv_finished"})
-        return httpx.Response(202, json={})
+    def response_for(item: dict[str, Any]) -> dict[str, Any]:
+        if item.get("type") == "external_subagent_start":
+            return {"queued": False, "child_session_id": "conv_finished"}
+        return {}
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
+        transport=httpx.MockTransport(_batch_safe_handler(response_for)),
         base_url="http://ap",
     ) as client:
         poll_kwargs: dict[str, Any] = {
@@ -890,7 +901,11 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
 
         read_before = _process_read_bytes()
         state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
-        reread_bytes = _process_read_bytes() - read_before  # type: ignore[operator]
+        read_after = _process_read_bytes()
+        assert read_before is not None and read_after is not None, (
+            "/proc/self/io became unreadable"
+        )
+        reread_bytes = read_after - read_before
 
     assert "a-unresolved" not in state.subagents
     assert reread_bytes < transcript_bytes // 4, (
@@ -933,18 +948,13 @@ async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
         encoding="utf-8",
     )
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        if body.get("type") != "external_subagent_start":
-            return httpx.Response(202, json={})
-        subagent_id = body["data"]["subagent_id"]
-        return httpx.Response(
-            202,
-            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
-        )
+    def response_for(item: dict[str, Any]) -> dict[str, Any]:
+        if item.get("type") != "external_subagent_start":
+            return {}
+        return {"queued": False, "child_session_id": f"conv_{item['data']['subagent_id']}"}
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
+        transport=httpx.MockTransport(_batch_safe_handler(response_for)),
         base_url="http://ap",
     ) as client:
         poll_kwargs: dict[str, Any] = {
@@ -974,3 +984,86 @@ async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
     late = state.subagents["a-late"]
     assert late.child_conversation_id == "conv_a-late"
     assert late.parent_subagent_id == (None if spawn_owner == "root" else "a-finished")
+
+
+def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged transcript is served from the memo; the memo evicts the least
+    recently used entry past its cap and forgets a transcript that disappears."""
+    scans: list[Path] = []
+    real_scan = forwarder._tool_use_ids_in_transcript
+
+    def counting_scan(path: Path, *, include_sidechains: bool) -> set[str] | None:
+        scans.append(path)
+        return real_scan(path, include_sidechains=include_sidechains)
+
+    monkeypatch.setattr(forwarder, "_tool_use_ids_in_transcript", counting_scan)
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES", 2)
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"transcript-{index}.jsonl"
+        path.write_text(
+            json.dumps(_spawn_record(f"toolu_{index}", "spawn", sidechain=False)) + "\n",
+            encoding="utf-8",
+        )
+        paths.append(path)
+
+    first = forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False)
+    assert first == {"toolu_0"}
+    assert forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False) == first
+    assert scans == [paths[0]], "an unchanged transcript was rescanned"
+
+    with paths[0].open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_spawn_record("toolu_0b", "spawn", sidechain=False)) + "\n")
+    assert forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False) == {
+        "toolu_0",
+        "toolu_0b",
+    }
+    assert scans == [paths[0], paths[0]]
+
+    forwarder._spawn_tool_use_ids_cached(paths[1], include_sidechains=False)
+    forwarder._spawn_tool_use_ids_cached(paths[2], include_sidechains=False)
+    assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[1], paths[2]}, (
+        "the least recently used entry was not evicted past the cap"
+    )
+
+    paths[2].unlink()
+    assert forwarder._spawn_tool_use_ids_cached(paths[2], include_sidechains=False) == frozenset()
+    assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[1]}
+
+
+def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that fails after a successful stat must not be remembered as a
+    transcript without spawns; the next poll re-reads the unchanged file and
+    finds the parent."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-child",
+        agent_type="general-purpose",
+        description="child whose parent read fails once",
+        tool_use_id="toolu_child",
+    )
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
+    real_read_text = Path.read_text
+    failures_left = [1]
+
+    def flaky_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == transcript_path and failures_left[0]:
+            failures_left[0] -= 1
+            raise OSError(errno.EIO, "transient read failure")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+
+    assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {}
+    assert transcript_path not in forwarder._SPAWN_TOOL_USE_ID_CACHE
+    assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {
+        "toolu_child": None
+    }

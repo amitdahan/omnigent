@@ -2509,7 +2509,7 @@ def _tool_use_ids_in_transcript(
     transcript_path: Path,
     *,
     include_sidechains: bool,
-) -> set[str]:
+) -> set[str] | None:
     """Return assistant tool-use ids from a Claude transcript.
 
     A partial trailing record is ignored because Claude may still be writing it;
@@ -2518,7 +2518,8 @@ def _tool_use_ids_in_transcript(
     :param transcript_path: Claude JSONL transcript to inspect.
     :param include_sidechains: Whether records mirrored from child agents
         belong to this transcript owner.
-    :returns: Tool-use ids owned by this transcript.
+    :returns: Tool-use ids owned by this transcript, or ``None`` when the file
+        could not be read so the caller retries on the next poll.
     """
     try:
         # ``errors="replace"`` tolerates a snapshot that ends mid-multibyte char
@@ -2526,7 +2527,7 @@ def _tool_use_ids_in_transcript(
         # and is skipped, and the completed record is read on the next poll.
         lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return set()
+        return None
     tool_use_ids: set[str] = set()
     for line in lines:
         try:
@@ -2576,8 +2577,11 @@ class _TranscriptSpawnIdCacheEntry:
 
 # Spawn-id correlation memo keyed by transcript path. An unregistered meta
 # re-runs correlation every poll, so unchanged transcripts must not be
-# re-parsed each time; one small entry is kept per transcript correlated.
+# re-parsed each time. Shared by every session's forwarder thread, hence the
+# lock; least recently used entries age out past the cap.
 _SPAWN_TOOL_USE_ID_CACHE: dict[Path, _TranscriptSpawnIdCacheEntry] = {}
+_SPAWN_TOOL_USE_ID_CACHE_LOCK = threading.Lock()
+_SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES = 1024
 
 
 def _spawn_tool_use_ids_cached(
@@ -2596,26 +2600,37 @@ def _spawn_tool_use_ids_cached(
     try:
         stat = transcript_path.stat()
     except OSError:
+        with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
+            _SPAWN_TOOL_USE_ID_CACHE.pop(transcript_path, None)
         return frozenset()
-    cached = _SPAWN_TOOL_USE_ID_CACHE.get(transcript_path)
-    if (
-        cached is not None
-        and cached.size == stat.st_size
-        and cached.mtime_ns == stat.st_mtime_ns
-        and cached.include_sidechains == include_sidechains
-    ):
-        return cached.tool_use_ids
+    with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
+        cached = _SPAWN_TOOL_USE_ID_CACHE.pop(transcript_path, None)
+        if (
+            cached is not None
+            and cached.size == stat.st_size
+            and cached.mtime_ns == stat.st_mtime_ns
+            and cached.include_sidechains == include_sidechains
+        ):
+            # Re-insert so the entry is the most recently used.
+            _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = cached
+            return cached.tool_use_ids
     # Stat before read: a write landing in between is filed under the older
     # stat, so the next poll sees a changed file and rescans.
-    tool_use_ids = frozenset(
-        _tool_use_ids_in_transcript(transcript_path, include_sidechains=include_sidechains)
-    )
-    _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = _TranscriptSpawnIdCacheEntry(
-        size=stat.st_size,
-        mtime_ns=stat.st_mtime_ns,
-        include_sidechains=include_sidechains,
-        tool_use_ids=tool_use_ids,
-    )
+    scanned = _tool_use_ids_in_transcript(transcript_path, include_sidechains=include_sidechains)
+    if scanned is None:
+        # A failed read is not an empty transcript; leave it uncached so the
+        # next poll retries instead of trusting an empty result.
+        return frozenset()
+    tool_use_ids = frozenset(scanned)
+    with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
+        _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = _TranscriptSpawnIdCacheEntry(
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            include_sidechains=include_sidechains,
+            tool_use_ids=tool_use_ids,
+        )
+        while len(_SPAWN_TOOL_USE_ID_CACHE) > _SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES:
+            _SPAWN_TOOL_USE_ID_CACHE.pop(next(iter(_SPAWN_TOOL_USE_ID_CACHE)))
     return tool_use_ids
 
 
