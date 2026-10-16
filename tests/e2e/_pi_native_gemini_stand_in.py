@@ -69,7 +69,11 @@ class GeminiStandIn:
 
     def handle(self, handler: BaseHTTPRequestHandler) -> None:
         raw = handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
-        body = json.loads(raw or b"{}")
+        try:
+            body = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            handler.send_error(400, "stand-in received a non-JSON request body")
+            return
         with self.lock:
             self.requests.append({"path": handler.path, "body": body})
             offenders = empty_function_response_names(body)

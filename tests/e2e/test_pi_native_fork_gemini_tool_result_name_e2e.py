@@ -182,16 +182,17 @@ def function_response_names(request_body: dict[str, Any]) -> list[str]:
     ]
 
 
-def last_function_response(stand_in: GeminiStandIn) -> dict[str, Any]:
-    """Body of the most recent request that replayed a tool result.
+def last_function_response(requests: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Body of the most recent request in ``requests`` that replayed a tool result.
 
-    Self-locating so an auxiliary ``generateContent`` call or retry after the
-    reply cannot shift the assertion onto the wrong request body.
+    Searches only the supplied slice so a fork that drops tool results from its
+    rebuilt history cannot fall back to an earlier turn's request and pass.
+    Returns ``None`` when no request in the slice carries a ``functionResponse``.
     """
-    for request in reversed(stand_in.requests):
+    for request in reversed(requests):
         if function_response_names(request["body"]):
             return request["body"]
-    raise AssertionError("stand-in received no request carrying a functionResponse")
+    return None
 
 
 def create_pi_session(client: httpx.Client, tmp_path: Path) -> str:
@@ -240,7 +241,9 @@ def test_pi_native_fork_on_gemini_replays_tool_results_with_names(
         assert [call["name"] for call in calls] == [TOOL_NAME]
         assert [output["call_id"] for output in outputs] == [calls[0]["call_id"]]
         # The live turn names its tool result; only the rebuilt history is in question.
-        assert function_response_names(last_function_response(rig.stand_in)) == [TOOL_NAME]
+        live_request = last_function_response(rig.stand_in.requests)
+        assert live_request is not None
+        assert function_response_names(live_request) == [TOOL_NAME]
 
         fork = client.post(f"/v1/sessions/{source_id}/fork", json={})
         fork.raise_for_status()
@@ -248,10 +251,12 @@ def test_pi_native_fork_on_gemini_replays_tool_results_with_names(
         session_ids.append(fork_id)
         bind_session_runner(client.patch, "", fork_id, rig.runner_id)
         before = len(session_items(client, fork_id))
+        requests_before_fork = len(rig.stand_in.requests)
         send_message(client, fork_id, FORK_PROMPT)
         outcome = wait_for(lambda: turn_outcome(session_items(client, fork_id), before))
 
-        fork_request = last_function_response(rig.stand_in)
+        fork_request = last_function_response(rig.stand_in.requests[requests_before_fork:])
+        assert fork_request is not None, outcome["text"]
         assert function_response_names(fork_request) == [TOOL_NAME], outcome["text"]
         assert outcome["kind"] == "assistant" and FORK_REPLY in outcome["text"], outcome["text"]
     finally:
