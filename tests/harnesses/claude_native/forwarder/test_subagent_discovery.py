@@ -7,6 +7,7 @@ import contextlib
 import errno
 import json
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -865,8 +866,6 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
     on every poll, so runner CPU and read volume grew with files that had not
     changed since the previous poll.
     """
-    if _process_read_bytes() is None:
-        pytest.skip("requires /proc/self/io read accounting")
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -923,17 +922,17 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
         read_before = _process_read_bytes()
         state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
         read_after = _process_read_bytes()
-        assert read_before is not None and read_after is not None, (
-            "/proc/self/io became unreadable"
-        )
-        reread_bytes = read_after - read_before
 
     assert "a-unresolved" not in state.subagents
     assert scans == [], "an idle poll re-scanned unchanged transcripts"
-    assert reread_bytes < transcript_bytes // 4, (
-        f"an idle poll with unchanged files read {reread_bytes} bytes "
-        f"(transcripts total {transcript_bytes} bytes)"
-    )
+    # Linux /proc accounting measures the reported quantity (bytes read) directly;
+    # elsewhere the scan count above is the whole check.
+    if read_before is not None and read_after is not None:
+        reread_bytes = read_after - read_before
+        assert reread_bytes < transcript_bytes // 4, (
+            f"an idle poll with unchanged files read {reread_bytes} bytes "
+            f"(transcripts total {transcript_bytes} bytes)"
+        )
 
 
 @pytest.mark.parametrize("spawn_owner", ["root", "helper"])
@@ -1037,6 +1036,19 @@ def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
     }
     assert scans == [paths[0], paths[0]]
 
+    # A same-size rewrite moves only the mtime, which must still invalidate the memo.
+    before = paths[0].stat()
+    paths[0].write_text(
+        paths[0].read_text(encoding="utf-8").replace("toolu_0b", "toolu_0c"), encoding="utf-8"
+    )
+    os.utime(paths[0], ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+    assert paths[0].stat().st_size == before.st_size
+    assert forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False) == {
+        "toolu_0",
+        "toolu_0c",
+    }
+    assert scans == [paths[0]] * 3
+
     forwarder._spawn_tool_use_ids_cached(paths[1], include_sidechains=False)
     # Hitting the older entry makes it the most recently used, so the cap evicts
     # the untouched one instead.
@@ -1045,7 +1057,7 @@ def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
     assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[0], paths[2]}, (
         "the least recently used entry was not the one evicted past the cap"
     )
-    assert scans == [paths[0], paths[0], paths[1], paths[2]]
+    assert scans == [paths[0]] * 3 + [paths[1], paths[2]]
 
     paths[2].unlink()
     assert forwarder._spawn_tool_use_ids_cached(paths[2], include_sidechains=False) == frozenset()
