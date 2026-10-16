@@ -52,6 +52,7 @@ from omnigent.cli_config import (
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
 )
+from omnigent.cli_diagnostics import printable as _printable
 from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
 from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
@@ -11738,11 +11739,6 @@ def _agent_dir_name(agent_dir: Path) -> str:
     except (yaml.YAMLError, AttributeError, OSError, ValueError):  # ValueError: bad UTF-8
         name = None
     return name if isinstance(name, str) and name else agent_dir.name
-
-
-def _printable(text: str) -> str:
-    """Escape control characters so repo-supplied text can't rewrite the terminal."""
-    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
 
 
 _LFS_POINTER = b"version https://git-lfs.github.com/spec/"

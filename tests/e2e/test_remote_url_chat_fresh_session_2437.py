@@ -30,6 +30,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -39,7 +40,11 @@ import pytest
 import yaml as _yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
-from tests._helpers.live_server import isolated_local_server, isolated_process_env
+from tests._helpers.live_server import (
+    isolated_local_server,
+    isolated_process_env,
+    terminate_process,
+)
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
@@ -601,3 +606,90 @@ def test_run_one_shot_without_online_runner_fails_cleanly(tmp_path: Path) -> Non
     assert "no online runner" in output, output
     assert "Traceback (most recent call last)" not in output, output
     assert "crash report" not in output, output
+
+
+# ---------------------------------------------------------------------------
+# Host launch: a connected host but no online runner
+# ---------------------------------------------------------------------------
+
+
+def _wait_until(predicate: object, *, timeout: float, what: str) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():  # type: ignore[operator]
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def test_run_one_shot_launches_a_runner_on_this_machines_host(
+    mock_llm_server_url: str | None,
+    tmp_path: Path,
+) -> None:
+    """With only a connected host (no runner), the CLI has the server launch one there.
+
+    The CLI and ``omnigent host`` share a home, so the CLI is "this machine's"
+    host. The one-shot must answer through the launched runner and then stop it.
+    """
+    suffix = uuid.uuid4().hex[:6]
+    agent_name = f"host-launch-{suffix}"
+    model = f"mock-{suffix}"
+    marker = f"HOST_LAUNCH_OK_{suffix}"
+    yaml_path = _write_agent_yaml(
+        tmp_path, agent_name=agent_name, model=model, mock_llm_server_url=mock_llm_server_url
+    )
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, [{"text": marker}] * 4, key=model)
+    home = tmp_path / "cli-home"
+    home.mkdir()
+
+    with isolated_local_server(tmp_path / "server", extra_args=["--agent", str(yaml_path)]) as url:
+        host_log = (tmp_path / "host.log").open("w")
+        host = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from omnigent.cli import main\n\nmain()\n",
+                "host",
+                "--server",
+                url,
+                "--no-open",
+                "--non-interactive",
+            ],
+            env=isolated_process_env(home, {"TERM": "dumb", "OPENAI_API_KEY": "mock-key"}, None),
+            stdin=subprocess.DEVNULL,
+            stdout=host_log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            with httpx.Client(base_url=url, timeout=10.0) as client:
+
+                def _host_online() -> bool:
+                    hosts = client.get("/v1/hosts").json().get("hosts", [])
+                    return any(h.get("status") == "online" for h in hosts)
+
+                _wait_until(_host_online, timeout=90.0, what="the host to connect")
+                assert client.get("/v1/runners").json()["data"] == []
+
+                proc = _run_cli(
+                    home, "run", "--server", url, "--agent", agent_name, "-p", "hi", timeout=180.0
+                )
+                output = proc.stdout + proc.stderr
+                assert proc.returncode == 0, output + (tmp_path / "host.log").read_text()
+                assert marker in proc.stdout, output
+
+                sessions = client.get(
+                    "/v1/sessions", params={"visibility": "all", "limit": 10}
+                ).json()["data"]
+                assert len(sessions) == 1 and sessions[0].get("host_id"), sessions
+                # The one-shot stops the runner it caused the host to launch.
+                _wait_until(
+                    lambda: (
+                        not any(r.get("online") for r in client.get("/v1/runners").json()["data"])
+                    ),
+                    timeout=60.0,
+                    what="the launched runner to stop",
+                )
+        finally:
+            terminate_process(host)
+            host_log.close()

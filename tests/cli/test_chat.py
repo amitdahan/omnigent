@@ -1852,17 +1852,29 @@ def _serve_listings(
     *,
     sessions: list[dict[str, str]],
     agent_pages: list[dict[str, object]],
+    user_pages: list[dict[str, object]] | None = None,
+    user_status: int = 200,
 ) -> list[tuple[str, object]]:
     """Answer ``GET /v1/sessions`` and successive ``GET /v1/agents`` pages.
+
+    ``scope=user`` requests get *user_pages* (none by default), or fail with
+    *user_status*; they aren't recorded.
 
     :returns: The ``(route, after-cursor)`` pairs requested, in order.
     """
     requests: list[tuple[str, object]] = []
     pages = iter(agent_pages)
+    user = iter(user_pages or [])
 
     def _get(url: str, **kwargs: object) -> SimpleNamespace:
         route = url.rsplit("/v1/", 1)[1]
         params = kwargs.get("params")
+        if isinstance(params, dict) and params.get("scope") == "user":
+            if user_status >= 400:
+                response = httpx.Response(user_status, request=httpx.Request("GET", url))
+                return SimpleNamespace(raise_for_status=response.raise_for_status, json=dict)
+            page = next(user, {"data": [], "has_more": False})
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: page)
         requests.append((route, params.get("after") if isinstance(params, dict) else None))
         body: object = {"data": sessions} if route == "sessions" else next(pages)
         return SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
@@ -2367,6 +2379,9 @@ class _NoRunnerSessions:
         self, *, harness: str | None = None, canonicalize: object = None
     ) -> str | None:
         return None
+
+    async def list_launch_hosts(self, **_kwargs: object) -> list[object]:
+        return []  # no connected host to launch one on either
 
 
 async def test_query_sessions_once_without_online_runner_is_a_cli_error() -> None:
@@ -5346,3 +5361,461 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+# ---------------------------------------------------------------------------
+# Host launch, user agents, resume by harness, escaped names
+# ---------------------------------------------------------------------------
+
+
+def _local_host(monkeypatch: pytest.MonkeyPatch, host_id: str | None) -> None:
+    import omnigent.host.identity as identity
+
+    local = SimpleNamespace(host_id=host_id, name="me.local") if host_id else None
+    monkeypatch.setattr(identity, "load_host_identity_if_present", lambda *_a, **_kw: local)
+
+
+class _LaunchSessions:
+    """Sessions stub for a one-shot turn on a server with no online runner."""
+
+    def __init__(
+        self,
+        *,
+        online_runner: str | None = None,
+        hosts: list[object] | None = None,
+        stop_error: Exception | None = None,
+    ) -> None:
+        from omnigent_client import LaunchHost
+
+        self._online_runner = online_runner
+        default: list[object] = [LaunchHost("host_local", "me.local")]
+        self._hosts: list[object] = hosts if hosts is not None else default
+        self._stop_error = stop_error
+        self.events: list[tuple[str, dict[str, object]]] = []
+        self.created: dict[str, object] = {}
+        self.bound: list[str] = []
+
+    async def resolve_agent(self, _name: str) -> SimpleNamespace:
+        return SimpleNamespace(id="id_scribe", harness="claude-sdk")
+
+    async def resolve_online_runner(self, **_kwargs: object) -> str | None:
+        return self._online_runner
+
+    async def list_launch_hosts(self, **_kwargs: object) -> list[object]:
+        return self._hosts
+
+    async def create_from_agent_id(self, agent_id: str, **kwargs: object) -> SimpleNamespace:
+        self.created = dict(kwargs, agent_id=agent_id)
+        return SimpleNamespace(id="conv_new")
+
+    async def bind_runner(self, session_id: str, *, runner_id: str) -> SimpleNamespace:
+        self.bound.append(runner_id)
+        return SimpleNamespace(id=session_id)
+
+    async def post_event(self, session_id: str, event: dict[str, object]) -> dict[str, object]:
+        self.events.append((session_id, event))
+        if self._stop_error is not None:
+            raise self._stop_error
+        return {"queued": False}
+
+
+def _launch_turn(sessions: _LaunchSessions, monkeypatch: pytest.MonkeyPatch) -> str | None:
+    async def _reply(_prompt: str) -> QueryResult:
+        return QueryResult(text="pong")
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", _fake_sessions_chat_cls(_reply))
+    client = SimpleNamespace(
+        sessions=sessions,
+        files=SimpleNamespace(for_session=lambda _sid: SimpleNamespace(upload=None, get=None)),
+        _fetch_agent_tools=lambda *_a, **_kw: [],
+    )
+    return asyncio.run(
+        chat_module._query_sessions_once(
+            client=client,  # type: ignore[arg-type]
+            agent_name="scribe",
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+        )
+    )
+
+
+_STOP = {"type": "stop_session", "data": {}}
+
+
+def test_one_shot_launches_on_this_host_and_stops_the_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No online runner but this machine is a connected host: launch there, then stop it."""
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions()
+
+    assert _launch_turn(sessions, monkeypatch) == "pong"
+
+    assert sessions.created["host_id"] == "host_local"
+    assert sessions.bound == []  # the server binds the runner it launched
+    assert sessions.events == [("conv_new", _STOP)]
+
+
+def test_one_shot_stop_failure_keeps_the_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions(stop_error=ClientOmnigentError("gone"))
+
+    assert _launch_turn(sessions, monkeypatch) == "pong"
+
+
+def test_one_shot_leaves_an_adopted_runner_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions(online_runner="runner_shared")
+
+    assert _launch_turn(sessions, monkeypatch) == "pong"
+
+    assert "host_id" not in sessions.created or sessions.created["host_id"] is None
+    assert sessions.bound == ["runner_shared"]
+    assert sessions.events == []
+
+
+def test_one_shot_with_only_other_machines_hosts_names_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another machine can't use this directory as its workspace, so say so."""
+    from omnigent_client import LaunchHost
+
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _local_host(monkeypatch, None)
+    sessions = _LaunchSessions(hosts=[LaunchHost("host_dev", "devbox.local")])
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _launch_turn(sessions, monkeypatch)
+
+    assert "devbox.local" in str(excinfo.value) and "host --server" in str(excinfo.value)
+    assert suppresses_recovery_hint(excinfo.value)
+    assert sessions.created == {}
+
+
+class _StopAtBind(Exception):
+    """Ends ``_query_sessions_once`` once the runner bind is observed."""
+
+
+def _resume_client(snapshot: SimpleNamespace, seen: dict[str, object]) -> SimpleNamespace:
+    async def _resolve_agent(name: str) -> SimpleNamespace:
+        seen["resolved"] = name
+        return SimpleNamespace(id="id_scribe", harness="claude-sdk")
+
+    async def _get(session_id: str) -> SimpleNamespace:
+        return snapshot
+
+    async def _online_runner(**kwargs: object) -> str:
+        seen["harness"] = kwargs.get("harness")
+        return "runner_1"
+
+    async def _bind_runner(session_id: str, *, runner_id: str) -> None:
+        raise _StopAtBind
+
+    return SimpleNamespace(
+        sessions=SimpleNamespace(
+            resolve_agent=_resolve_agent,
+            get=_get,
+            resolve_online_runner=_online_runner,
+            bind_runner=_bind_runner,
+        )
+    )
+
+
+def _resume_once(client: SimpleNamespace, agent_name: str) -> None:
+    asyncio.run(
+        chat_module._query_sessions_once(
+            client=client,  # type: ignore[arg-type]
+            agent_name=agent_name,
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+            resume_conversation_id="conv_x",
+        )
+    )
+
+
+def test_resume_one_shot_takes_the_harness_from_the_session() -> None:
+    """A resumed session may use an uploaded agent that isn't resolvable by name."""
+    seen: dict[str, object] = {}
+    snapshot = SimpleNamespace(id="conv_x", harness="claude-sdk", agent_name="uploaded")
+
+    with pytest.raises(_StopAtBind):
+        _resume_once(_resume_client(snapshot, seen), agent_name="uploaded")
+
+    assert seen == {"harness": "claude-sdk"}
+
+
+def test_resume_one_shot_without_snapshot_harness_resolves_the_sessions_agent() -> None:
+    seen: dict[str, object] = {}
+    snapshot = SimpleNamespace(id="conv_x", harness=None, agent_name="scribe")
+
+    with pytest.raises(_StopAtBind):
+        _resume_once(_resume_client(snapshot, seen), agent_name="scribe")
+
+    assert seen == {"resolved": "scribe", "harness": "claude-sdk"}
+
+
+def test_resume_one_shot_without_runner_fails_cleanly() -> None:
+    """Resuming never launches a runner itself; without one it says so, as before."""
+
+    async def _no_runner(**_kwargs: object) -> None:
+        return None
+
+    snapshot = SimpleNamespace(id="conv_x", harness="claude-sdk", agent_name="scribe")
+    client = _resume_client(snapshot, {})
+    client.sessions.resolve_online_runner = _no_runner
+
+    with pytest.raises(click.ClickException, match="no online runner"):
+        _resume_once(client, agent_name="scribe")
+
+
+def test_resume_one_shot_with_odd_harness_uses_the_sessions_agent() -> None:
+    """A non-string harness is ignored; the session's agent supplies it instead."""
+    seen: dict[str, object] = {}
+    snapshot = SimpleNamespace(id="conv_x", harness=["claude-sdk"], agent_name="scribe")
+
+    with pytest.raises(_StopAtBind):
+        _resume_once(_resume_client(snapshot, seen), agent_name="scribe")
+
+    assert seen == {"resolved": "scribe", "harness": "claude-sdk"}
+
+
+def test_resume_one_shot_harness_lookup_server_error_is_not_fatal() -> None:
+    """If the agent lookup for a harness-less snapshot fails, carry on without a harness."""
+    seen: dict[str, object] = {}
+    snapshot = SimpleNamespace(id="conv_x", harness=None, agent_name="scribe")
+    client = _resume_client(snapshot, seen)
+
+    async def _listing_fails(_name: str) -> object:
+        raise ClientOmnigentError("listing failed")
+
+    client.sessions.resolve_agent = _listing_fails
+
+    with pytest.raises(_StopAtBind):
+        _resume_once(client, agent_name="scribe")
+
+    assert seen == {"harness": None}
+
+
+def test_one_shot_unknown_agent_is_a_clean_cli_error() -> None:
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    async def _resolve_agent(name: str) -> object:
+        raise LookupError(f"No agent named {name!r} is registered on this server.")
+
+    client = SimpleNamespace(sessions=SimpleNamespace(resolve_agent=_resolve_agent))
+
+    with pytest.raises(click.ClickException, match="No agent named") as excinfo:
+        asyncio.run(
+            chat_module._query_sessions_once(
+                client=client,  # type: ignore[arg-type]
+                agent_name="ghost",
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+            )
+        )
+
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+def test_require_registered_agent_accepts_a_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent agent add`` installs a user agent; ``--agent`` must accept it."""
+    _serve_listings(
+        monkeypatch,
+        sessions=[],
+        agent_pages=[_agents_page(["scribe"])],
+        user_pages=[_agents_page(["mine"])],
+    )
+
+    assert chat_module._require_registered_agent("http://127.0.0.1:6799", "mine") == "mine"
+
+
+def test_pick_agent_offers_user_agents_on_a_fresh_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve_listings(
+        monkeypatch,
+        sessions=[],
+        agent_pages=[_agents_page(["scribe"])],
+        user_pages=[_agents_page(["mine"])],
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("http://127.0.0.1:6799", interactive=False)
+
+    assert "scribe" in str(excinfo.value) and "mine" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 422, 500])
+def test_user_agent_listing_problems_fall_back_to_server_agents(
+    status: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User agents are optional: an old or failing ``scope=user`` listing isn't fatal."""
+    page = _agents_page(["scribe"])
+    _serve_listings(monkeypatch, sessions=[], agent_pages=[page, page], user_status=status)
+
+    assert chat_module._require_registered_agent("http://127.0.0.1:6799", "scribe") == "scribe"
+    assert _pick_agent("http://127.0.0.1:6799", interactive=False) == "scribe"
+
+
+_EVIL = "evil\x1b[2J\x1b]0;pwned\x07"
+
+
+def test_agent_names_are_escaped_in_errors_and_the_picker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Server-supplied names can't inject terminal control sequences."""
+    page = _agents_page([_EVIL, "scribe"])
+    _serve_listings(monkeypatch, sessions=[], agent_pages=[page, page, page])
+
+    with pytest.raises(click.ClickException) as ambiguous:
+        _pick_agent("http://127.0.0.1:6799", interactive=False)
+    with pytest.raises(click.ClickException) as unknown:
+        chat_module._require_registered_agent("http://127.0.0.1:6799", "nope\x1b[2J")
+    monkeypatch.setattr(chat_module.click, "prompt", lambda *_a, **_kw: "2")
+    _pick_agent("http://127.0.0.1:6799")
+    picker = capsys.readouterr().out
+
+    for text in (str(ambiguous.value), str(unknown.value), picker):
+        assert "\x1b" not in text
+        assert "\\x1b" in text
+
+
+# ---------------------------------------------------------------------------
+# Cleanup ordering, user-agent listing and messages
+# ---------------------------------------------------------------------------
+
+
+def test_one_shot_stops_the_launched_runner_when_the_turn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions()
+
+    async def _boom(_prompt: str) -> QueryResult:
+        raise RuntimeError("turn exploded")
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", _fake_sessions_chat_cls(_boom))
+    client = SimpleNamespace(
+        sessions=sessions,
+        files=SimpleNamespace(for_session=lambda _sid: SimpleNamespace(upload=None, get=None)),
+        _fetch_agent_tools=lambda *_a, **_kw: [],
+    )
+
+    with pytest.raises(RuntimeError, match="turn exploded"):
+        asyncio.run(
+            chat_module._query_sessions_once(
+                client=client,  # type: ignore[arg-type]
+                agent_name="scribe",
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+            )
+        )
+
+    assert sessions.events == [("conv_new", _STOP)]
+
+
+def test_one_shot_stops_the_launched_runner_when_session_ready_callback_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup covers everything after the host-launched session exists."""
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions()
+    client = SimpleNamespace(
+        sessions=sessions,
+        files=SimpleNamespace(for_session=lambda _sid: SimpleNamespace(upload=None, get=None)),
+        _fetch_agent_tools=lambda *_a, **_kw: [],
+    )
+
+    def _ready(_session_id: str) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(
+            chat_module._query_sessions_once(
+                client=client,  # type: ignore[arg-type]
+                agent_name="scribe",
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+                on_session_ready=_ready,
+            )
+        )
+
+    assert sessions.events == [("conv_new", _STOP)]
+
+
+def test_require_registered_agent_with_failing_user_listing_lists_server_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user agent can't be found when ``scope=user`` fails; the error still lists server ones."""
+    _serve_listings(
+        monkeypatch, sessions=[], agent_pages=[_agents_page(["scribe"])], user_status=500
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        chat_module._require_registered_agent("http://127.0.0.1:6799", "mine")
+
+    assert "scribe" in str(excinfo.value)
+
+
+def test_user_agents_follow_the_listing_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve_listings(
+        monkeypatch,
+        sessions=[],
+        agent_pages=[_agents_page(["scribe"])],
+        user_pages=[_agents_page(["a"], has_more=True, last_id="ag_a"), _agents_page(["b"])],
+    )
+
+    assert chat_module._require_registered_agent("http://127.0.0.1:6799", "b") == "b"
+
+
+def test_no_registered_agents_message_mentions_agent_add() -> None:
+    message = chat_module._no_registered_agents_message("http://127.0.0.1:6799")
+
+    assert "No agents are registered" in message
+    assert "agent add" in message
+
+
+def test_one_shot_stops_the_launched_runner_on_ctrl_c_mid_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions()
+
+    async def _interrupted(_prompt: str) -> QueryResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", _fake_sessions_chat_cls(_interrupted))
+    client = SimpleNamespace(
+        sessions=sessions,
+        files=SimpleNamespace(for_session=lambda _sid: SimpleNamespace(upload=None, get=None)),
+        _fetch_agent_tools=lambda *_a, **_kw: [],
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(
+            chat_module._query_sessions_once(
+                client=client,  # type: ignore[arg-type]
+                agent_name="scribe",
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+            )
+        )
+
+    assert sessions.events == [("conv_new", _STOP)]
