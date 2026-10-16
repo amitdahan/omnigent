@@ -26,6 +26,25 @@ from tests.harnesses.claude_native.forwarder._support import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_spawn_id_memo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with an empty spawn-id memo so entries never leak between tests."""
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
+
+
+def _count_transcript_scans(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Record every transcript the forwarder parses for spawn ids from now on."""
+    scans: list[Path] = []
+    real_scan = forwarder._tool_use_ids_in_transcript
+
+    def counting_scan(path: Path, *, include_sidechains: bool) -> set[str] | None:
+        scans.append(path)
+        return real_scan(path, include_sidechains=include_sidechains)
+
+    monkeypatch.setattr(forwarder, "_tool_use_ids_in_transcript", counting_scan)
+    return scans
+
+
 async def test_subagent_watcher_registers_a_task_named_spawn(
     tmp_path: Path,
 ) -> None:
@@ -848,7 +867,6 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
     """
     if _process_read_bytes() is None:
         pytest.skip("requires /proc/self/io read accounting")
-    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -901,6 +919,7 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
         assert state.subagents["a-finished"].child_conversation_id == "conv_finished"
         assert "a-unresolved" not in state.subagents
 
+        scans = _count_transcript_scans(monkeypatch)
         read_before = _process_read_bytes()
         state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
         read_after = _process_read_bytes()
@@ -910,6 +929,7 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
         reread_bytes = read_after - read_before
 
     assert "a-unresolved" not in state.subagents
+    assert scans == [], "an idle poll re-scanned unchanged transcripts"
     assert reread_bytes < transcript_bytes // 4, (
         f"an idle poll with unchanged files read {reread_bytes} bytes "
         f"(transcripts total {transcript_bytes} bytes)"
@@ -920,7 +940,6 @@ async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
 async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
     tmp_path: Path,
     spawn_owner: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A spawn record appended after idle polls still resolves its waiting meta.
 
@@ -929,7 +948,6 @@ async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
     the root transcript or a helper's sidechain transcript, and register the
     sub-agent under the owner that issued the spawn.
     """
-    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -993,17 +1011,9 @@ async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
 def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unchanged transcript is served from the memo; the memo evicts the least
-    recently used entry past its cap and forgets a transcript that disappears."""
-    scans: list[Path] = []
-    real_scan = forwarder._tool_use_ids_in_transcript
-
-    def counting_scan(path: Path, *, include_sidechains: bool) -> set[str] | None:
-        scans.append(path)
-        return real_scan(path, include_sidechains=include_sidechains)
-
-    monkeypatch.setattr(forwarder, "_tool_use_ids_in_transcript", counting_scan)
-    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
+    """An unchanged transcript is served from the memo; a hit refreshes its recency;
+    the least recently used entry is evicted past the cap; a vanished file is forgotten."""
+    scans = _count_transcript_scans(monkeypatch)
     monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES", 2)
     paths = []
     for index in range(3):
@@ -1028,14 +1038,18 @@ def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
     assert scans == [paths[0], paths[0]]
 
     forwarder._spawn_tool_use_ids_cached(paths[1], include_sidechains=False)
+    # Hitting the older entry makes it the most recently used, so the cap evicts
+    # the untouched one instead.
+    forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False)
     forwarder._spawn_tool_use_ids_cached(paths[2], include_sidechains=False)
-    assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[1], paths[2]}, (
-        "the least recently used entry was not evicted past the cap"
+    assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[0], paths[2]}, (
+        "the least recently used entry was not the one evicted past the cap"
     )
+    assert scans == [paths[0], paths[0], paths[1], paths[2]]
 
     paths[2].unlink()
     assert forwarder._spawn_tool_use_ids_cached(paths[2], include_sidechains=False) == frozenset()
-    assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[1]}
+    assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[0]}
 
 
 def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
@@ -1054,7 +1068,6 @@ def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
         tool_use_id="toolu_child",
     )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
-    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
     real_read_text = Path.read_text
     failures_left = [1]
 
