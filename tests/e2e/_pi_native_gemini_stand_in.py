@@ -65,6 +65,7 @@ class GeminiStandIn:
     replies: list[dict[str, Any]]
     fallback_text: str = "STAND-IN-FALLBACK"
     requests: list[dict[str, Any]] = field(default_factory=list)
+    fallback_served: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def handle(self, handler: BaseHTTPRequestHandler) -> None:
@@ -84,7 +85,13 @@ class GeminiStandIn:
                 ).encode()
                 status, content_type = 400, "application/json"
             else:
-                part = self.replies.pop(0) if self.replies else text_reply(self.fallback_text)
+                if self.replies:
+                    part = self.replies.pop(0)
+                else:
+                    # Count fallback use so a test can assert its script was consumed
+                    # exactly and an unexpected extra request does not pass silently.
+                    self.fallback_served += 1
+                    part = text_reply(self.fallback_text)
                 payload = _sse_body(part)
                 status, content_type = 200, "text/event-stream"
         # Write outside the lock so a slow client never blocks other handlers.
@@ -93,6 +100,11 @@ class GeminiStandIn:
         handler.send_header("Content-Length", str(len(payload)))
         handler.end_headers()
         handler.wfile.write(payload)
+
+    def snapshot_requests(self) -> list[dict[str, Any]]:
+        """Return a copy of the recorded requests taken under the lock."""
+        with self.lock:
+            return list(self.requests)
 
 
 @contextmanager

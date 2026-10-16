@@ -160,7 +160,7 @@ def _tool_result_messages(session_file: Path) -> list[dict]:
     return messages
 
 
-def _tool_result_call_ids(session_file: Path) -> list[str]:
+def _tool_result_call_ids(session_file: Path) -> list[str | None]:
     """Return the ``toolCallId`` of every ``toolResult`` record, in file order."""
     return [message.get("toolCallId") for message in _tool_result_messages(session_file)]
 

@@ -241,7 +241,7 @@ def test_pi_native_fork_on_gemini_replays_tool_results_with_names(
         assert [call["name"] for call in calls] == [TOOL_NAME]
         assert [output["call_id"] for output in outputs] == [calls[0]["call_id"]]
         # The live turn names its tool result; only the rebuilt history is in question.
-        live_request = last_function_response(rig.stand_in.requests)
+        live_request = last_function_response(rig.stand_in.snapshot_requests())
         assert live_request is not None
         assert function_response_names(live_request) == [TOOL_NAME]
 
@@ -251,14 +251,18 @@ def test_pi_native_fork_on_gemini_replays_tool_results_with_names(
         session_ids.append(fork_id)
         bind_session_runner(client.patch, "", fork_id, rig.runner_id)
         before = len(session_items(client, fork_id))
-        requests_before_fork = len(rig.stand_in.requests)
+        requests_before_fork = len(rig.stand_in.snapshot_requests())
         send_message(client, fork_id, FORK_PROMPT)
         outcome = wait_for(lambda: turn_outcome(session_items(client, fork_id), before))
 
-        fork_request = last_function_response(rig.stand_in.requests[requests_before_fork:])
+        fork_request = last_function_response(
+            rig.stand_in.snapshot_requests()[requests_before_fork:]
+        )
         assert fork_request is not None, outcome["text"]
         assert function_response_names(fork_request) == [TOOL_NAME], outcome["text"]
         assert outcome["kind"] == "assistant" and FORK_REPLY in outcome["text"], outcome["text"]
+        # Every scripted reply was consumed in order; no unexpected extra request.
+        assert rig.stand_in.fallback_served == 0, outcome["text"]
     finally:
         for session_id in reversed(session_ids):
             with suppress(httpx.HTTPError):
