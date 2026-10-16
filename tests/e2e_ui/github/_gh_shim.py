@@ -56,7 +56,8 @@ if args[:3] == ["repo", "set-default", "--view"]:
 if args[:2] == ["repo", "set-default"]:
     finish(0)
 if args[:2] == ["pr", "view"]:
-    fields = args[args.index("--json") + 1].split(",") if "--json" in args else []
+    json_at = args.index("--json") if "--json" in args else -1
+    fields = args[json_at + 1].split(",") if 0 <= json_at < len(args) - 1 else []
     if "statusCheckRollup" in fields and config["checks_error"]:
         finish(1, err=config["checks_error"])
     finish(0, json.dumps({name: pr[name] for name in fields if name in pr}))
@@ -86,6 +87,7 @@ def write_gh_shim(
     binary.mkdir(parents=True, exist_ok=True)
     config = {"repo": repo, "pr": pr, "checks_error": checks_error}
     (binary / "config.json").write_text(json.dumps(config))
+    (binary / "gh-calls.log").write_text("")
     impl = binary / "gh_impl.py"
     impl.write_text(GH_SHIM)
     gh = binary / "gh"
@@ -114,7 +116,9 @@ def make_checkout(workspace: Path, *, branch: str, remote: str) -> None:
         ["-C", str(workspace), "config", "core.untrackedCache", "true"],
         ["-C", str(workspace), "remote", "add", "origin", remote],
     ):
-        subprocess.run(["git", *args], check=True, capture_output=True)
+        result = subprocess.run(["git", *args], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"git {shlex.join(args)} failed: {result.stderr.strip()}")
 
 
 def stack_env(binary: Path, runtime: Path, model_url: str) -> dict[str, str]:
