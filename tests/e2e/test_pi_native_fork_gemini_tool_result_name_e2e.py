@@ -121,9 +121,11 @@ def pi_gemini_rig(tmp_path: Path) -> Iterator[PiGeminiRig]:
                 yield PiGeminiRig(client, stack.base_url, stack.runner_id, stand_in, workspace)
         finally:
             for socket in Path(short_tmp).rglob("tmux.sock"):
-                subprocess.run(
-                    ["tmux", "-S", str(socket), "kill-server"], capture_output=True, timeout=10
-                )
+                # A hung kill must not mask the real test failure being raised.
+                with suppress(subprocess.TimeoutExpired):
+                    subprocess.run(
+                        ["tmux", "-S", str(socket), "kill-server"], capture_output=True, timeout=10
+                    )
 
 
 @pytest.fixture
@@ -180,6 +182,18 @@ def function_response_names(request_body: dict[str, Any]) -> list[str]:
     ]
 
 
+def last_function_response(stand_in: GeminiStandIn) -> dict[str, Any]:
+    """Body of the most recent request that replayed a tool result.
+
+    Self-locating so an auxiliary ``generateContent`` call or retry after the
+    reply cannot shift the assertion onto the wrong request body.
+    """
+    for request in reversed(stand_in.requests):
+        if function_response_names(request["body"]):
+            return request["body"]
+    raise AssertionError("stand-in received no request carrying a functionResponse")
+
+
 def create_pi_session(client: httpx.Client, tmp_path: Path) -> str:
     spec = _materialize_pi_agent_spec(tmp_path)
     created = post_session_bundle(
@@ -226,7 +240,7 @@ def test_pi_native_fork_on_gemini_replays_tool_results_with_names(
         assert [call["name"] for call in calls] == [TOOL_NAME]
         assert [output["call_id"] for output in outputs] == [calls[0]["call_id"]]
         # The live turn names its tool result; only the rebuilt history is in question.
-        assert function_response_names(rig.stand_in.requests[-1]["body"]) == [TOOL_NAME]
+        assert function_response_names(last_function_response(rig.stand_in)) == [TOOL_NAME]
 
         fork = client.post(f"/v1/sessions/{source_id}/fork", json={})
         fork.raise_for_status()
@@ -237,7 +251,7 @@ def test_pi_native_fork_on_gemini_replays_tool_results_with_names(
         send_message(client, fork_id, FORK_PROMPT)
         outcome = wait_for(lambda: turn_outcome(session_items(client, fork_id), before))
 
-        fork_request = rig.stand_in.requests[-1]["body"]
+        fork_request = last_function_response(rig.stand_in)
         assert function_response_names(fork_request) == [TOOL_NAME], outcome["text"]
         assert outcome["kind"] == "assistant" and FORK_REPLY in outcome["text"], outcome["text"]
     finally:

@@ -78,16 +78,14 @@ class GeminiStandIn:
                 payload = json.dumps(
                     {"error": {"code": 400, "message": message, "status": "INVALID_ARGUMENT"}}
                 ).encode()
-                handler.send_response(400)
-                handler.send_header("Content-Type", "application/json")
-                handler.send_header("Content-Length", str(len(payload)))
-                handler.end_headers()
-                handler.wfile.write(payload)
-                return
-            part = self.replies.pop(0) if self.replies else text_reply(self.fallback_text)
-        payload = _sse_body(part)
-        handler.send_response(200)
-        handler.send_header("Content-Type", "text/event-stream")
+                status, content_type = 400, "application/json"
+            else:
+                part = self.replies.pop(0) if self.replies else text_reply(self.fallback_text)
+                payload = _sse_body(part)
+                status, content_type = 200, "text/event-stream"
+        # Write outside the lock so a slow client never blocks other handlers.
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(payload)))
         handler.end_headers()
         handler.wfile.write(payload)
