@@ -647,8 +647,8 @@ class ManagedSandboxConfig:
     :param launcher_factory: Zero-argument factory producing the
         :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher`
         each launch uses, e.g.
-        ``lambda: ModalSandboxLauncher(image=…)``. Called per launch
-        (launchers may cache provider handles internally). May raise
+        ``lambda: ModalSandboxLauncher(image=…)``. Must return a fresh instance
+        because calls bind the host owner's identity; never share it across users. May raise
         ``HTTPException`` to report an unusable backend — the YAML
         path uses this for providers without managed support.
     :param token_ttl_s: Launch-token lifetime in seconds, e.g.
@@ -3521,6 +3521,13 @@ def _select_provider_config(
     return selected
 
 
+def _launcher_for_owner(config: ManagedSandboxConfig, owner: str) -> SandboxHostLauncher:
+    """Construct a fresh launcher with the authenticated or persisted host owner."""
+    launcher = config.launcher_factory()
+    launcher.bind_principal(owner)
+    return launcher
+
+
 async def attach_sandbox_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3536,7 +3543,7 @@ async def attach_sandbox_host(
     immutable and saved before any wake; startup failures never delete the box.
     """
     entry = _select_provider_config(config, provider)
-    launcher = entry.launcher_factory()
+    launcher = _launcher_for_owner(entry, owner)
     if launcher.provider != provider or not launcher.capabilities.resume_stopped:
         raise HTTPException(400, "attachment requires a matching provider with resume support")
     try:
@@ -3629,7 +3636,7 @@ async def launch_managed_host(
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
-    launcher = entry.launcher_factory()
+    launcher = _launcher_for_owner(entry, owner)
     reusable = launcher.capabilities.reusable_hosts
     if reusable and not launcher.capabilities.resume_stopped:
         raise HTTPException(400, "reusable sandbox providers must support resume")
@@ -4075,7 +4082,7 @@ def _launcher_for_teardown(
         return None
     entry = config.recorded(host.sandbox_provider)
     try:
-        launcher = entry.launcher_factory()
+        launcher = _launcher_for_owner(entry, host.user_id)
     except HTTPException:
         # The YAML path's unsupported-provider factory raises; there is
         # no launcher to terminate with.

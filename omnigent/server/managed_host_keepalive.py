@@ -212,7 +212,9 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                 host.sandbox_provider
             )
             try:
-                extended = config.launcher_factory().keep_alive(host.sandbox_id)
+                from omnigent.server.managed_hosts import _launcher_for_owner
+
+                extended = _launcher_for_owner(config, host.user_id).keep_alive(host.sandbox_id)
                 # INFO from the server layer so the keepalive is visible in the
                 # server log (onboarding-layer loggers do not surface there); the
                 # provider logs the new deadline at debug. A provider returns
