@@ -40,6 +40,8 @@ Additive fields:
 - ``remote_host``: only with ``reason: "unsupported_remote"``.
 - PR associations in ``prs`` carry ``provider``.
 - The dispatcher adds descriptor ``provider_display`` to info and associations.
+- ``checks`` may also count ``cancelled`` and ``skipped`` jobs, with matching ``runs``
+  buckets. Providers that never report those outcomes omit the counts.
 - ``pr`` may carry ``author_id``, the PR author's stable id on the provider; optional,
   may be null.
 - A comment may carry ``author_id``, the author's stable id on the provider; optional,
