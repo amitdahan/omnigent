@@ -2,9 +2,9 @@
 //
 // The full TerminalSession constructor needs a real xterm + WebSocket
 // + DOM container, so it's exercised via manual REPL verification (see
-// TerminalView.test.ts). `openTerminalLink` is the one piece of our own
-// logic the WebLinksAddon delegates to — the click handler that makes
-// terminal URLs clickable — so we pin it here.
+// TerminalView.test.ts). `openTerminalLink` is the click handler the
+// terminal link provider delegates to — the piece that makes terminal URLs
+// open the right way — so we pin it here.
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -77,17 +77,33 @@ describe("openTerminalLink", () => {
     expect(pushSpy).not.toHaveBeenCalled();
   });
 
-  it("prevents the addon's default in-place navigation", () => {
+  it("rebases session links under the configured base path", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    window.history.replaceState(null, "", "/proxy/6767/");
+    try {
+      const pushSpy = vi.spyOn(window.history, "pushState");
+      const event = new MouseEvent("click");
+      // Unprefixed terminal link is rebased under the basename.
+      openTerminalLink(event, `${window.location.origin}/c/conv_x`);
+      expect(pushSpy).toHaveBeenCalledWith(null, "", "/proxy/6767/c/conv_x");
+      // Already-prefixed link is pushed unchanged (idempotent, no doubling).
+      openTerminalLink(event, `${window.location.origin}/proxy/6767/c/conv_y`);
+      expect(pushSpy).toHaveBeenCalledWith(null, "", "/proxy/6767/c/conv_y");
+    } finally {
+      delete window.__OMNIGENT_BASE_PATH__;
+    }
+  });
+
+  it("prevents the click's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");
     const preventSpy = vi.spyOn(event, "preventDefault");
 
     openTerminalLink(event, "https://example.com/foo");
 
-    // The WebLinksAddon navigates the current document on click by
-    // default; without preventDefault the click would unload the SPA
-    // (and kill the WebSocket-attached terminal) before window.open's
-    // tab is usable. A failure here means that suppression was dropped.
+    // Without preventDefault the click's default navigation would unload the
+    // SPA (and kill the WebSocket-attached terminal) before window.open's
+    // tab is usable.
     expect(preventSpy).toHaveBeenCalledOnce();
   });
 
@@ -1025,6 +1041,62 @@ describe("TerminalSession", () => {
       term.write(`\x1b]52;;${btoa("pane output")}\x07`, resolve);
     });
 
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it.each([true, false])(
+    "routes browser selections through consent without a recent-input requirement (bridge enabled: %s)",
+    (clipboardEnabled) => {
+      const onClipboardRequest = vi.fn();
+      const { container, session } = makeSession(
+        undefined,
+        undefined,
+        clipboardEnabled,
+        onClipboardRequest,
+      );
+      const term = (session as unknown as { term: Terminal }).term;
+      vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+      const setData = vi.fn();
+      const copy = new Event("copy", { bubbles: true, cancelable: true });
+      Object.defineProperty(copy, "clipboardData", { value: { setData } });
+      const textarea = container.querySelector("textarea")!;
+      const bypassConsent = vi.fn();
+      textarea.addEventListener("copy", bypassConsent);
+
+      textarea.dispatchEvent(copy);
+
+      expect(copy.defaultPrevented).toBe(true);
+      expect(bypassConsent).not.toHaveBeenCalled();
+      expect(setData).not.toHaveBeenCalled();
+      expect(onClipboardRequest).toHaveBeenCalledWith("selected text", copy);
+      session.dispose();
+    },
+  );
+
+  it("does not copy a browser selection without a consent handler", () => {
+    const { container, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+    const setData = vi.fn();
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(copy, "clipboardData", { value: { setData } });
+
+    container.querySelector("textarea")!.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(true);
+    expect(setData).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("leaves copying outside a terminal selection alone", () => {
+    const onClipboardRequest = vi.fn();
+    const { container, session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+
+    container.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(false);
     expect(onClipboardRequest).not.toHaveBeenCalled();
     session.dispose();
   });
