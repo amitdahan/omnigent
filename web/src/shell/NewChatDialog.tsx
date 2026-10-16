@@ -2354,7 +2354,14 @@ export function NewChatLandingScreen() {
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
-  const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
+  const sandboxLabelForProvider = (provider: string | null) =>
+    sandboxOptionLabel(
+      provider,
+      info !== "loading" &&
+        provider !== null &&
+        info.sandbox_provider_capabilities?.[provider]?.reusable_hosts === true,
+    );
+  const sandboxLabel = sandboxLabelForProvider(info !== "loading" ? info.sandbox_provider : null);
   // One picker row per configured provider; a single-provider server
   // yields exactly one.
   const sandboxProviderRows = useMemo(
@@ -2625,6 +2632,7 @@ export function NewChatLandingScreen() {
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [wakingHostId, setWakingHostId] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
   const [offlineHostLimit, setOfflineHostLimit] = useState(0);
@@ -2706,7 +2714,7 @@ export function NewChatLandingScreen() {
   const thisMachineHostId = resolveThisMachineHostId(
     desktopHost?.hostId ?? null,
     isCurrentServerLocal(),
-    onlineHosts.map((host) => host.host_id),
+    onlineHosts.filter((host) => !host.sandbox_provider).map((host) => host.host_id),
   );
   // When it's already in the host list (online or offline) we connect via that
   // row. With another live host there is already a valid place to run, so do
@@ -5030,7 +5038,7 @@ export function NewChatLandingScreen() {
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
-    sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
+    sandboxProvider !== null ? sandboxLabelForProvider(sandboxProvider) : sandboxLabel;
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
@@ -5190,6 +5198,26 @@ export function NewChatLandingScreen() {
     setPickedAgentId(PENDING_AGENT_ID);
     setPickedHarness(null);
   };
+
+  async function wakeAttachedHost(hostId: string) {
+    setWakingHostId(hostId);
+    setCreateError(null);
+    try {
+      const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/wake`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const body = await response.json();
+        throw new Error(body.detail || "Could not wake sandbox");
+      }
+      await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      selectHost(hostId);
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : "Could not wake sandbox");
+    } finally {
+      setWakingHostId(null);
+    }
+  }
 
   function selectHost(hostId: string) {
     // Persist the explicit pick even when it matches the current selection, so
@@ -5963,11 +5991,13 @@ export function NewChatLandingScreen() {
   // Keep the selected host and this machine's reconnect action above the fold.
   const listedHosts = [
     ...onlineHosts,
-    ...offlineHosts.filter((host) => host.host_id === selectedHostId || isReconnectRow(host)),
+    ...offlineHosts.filter(
+      (host) => host.sandbox_attached || host.host_id === selectedHostId || isReconnectRow(host),
+    ),
   ];
   // Preserve /v1/hosts order: most recently updated first.
   const otherOfflineHosts = offlineHosts.filter(
-    (host) => host.host_id !== selectedHostId && !isReconnectRow(host),
+    (host) => !host.sandbox_attached && host.host_id !== selectedHostId && !isReconnectRow(host),
   );
   const cloudHosts = listedHosts.filter(isCloudHostEntry);
   const localHosts = listedHosts.filter((host) => !isCloudHostEntry(host));
@@ -5985,14 +6015,22 @@ export function NewChatLandingScreen() {
     showArcaOption;
   const renderHostMenuItem = (host: Host) => {
     const reconnect = isReconnectRow(host);
+    const wakeable = host.sandbox_attached && host.status === "offline";
     return (
       <DropdownMenuItem
         key={host.host_id}
         onSelect={() => {
-          if (reconnect) pendingConnectRef.current = true;
+          if (wakeable) void wakeAttachedHost(host.host_id);
+          else if (reconnect) pendingConnectRef.current = true;
           else selectHost(host.host_id);
         }}
-        disabled={reconnect ? connectingThisMachine : host.status !== "online"}
+        disabled={
+          wakeable
+            ? wakingHostId !== null
+            : reconnect
+              ? connectingThisMachine
+              : host.status !== "online"
+        }
         data-testid={
           reconnect
             ? "new-chat-landing-run-on-this-machine"
@@ -6006,7 +6044,15 @@ export function NewChatLandingScreen() {
           host={host}
           cloud={isCloudHostEntry(host)}
           displayName={displayNameForHost(host, thisMachineHostId, navigator.userAgent)}
-          subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
+          subtitle={
+            wakeable
+              ? wakingHostId === host.host_id
+                ? "Waking…"
+                : "Asleep · click to wake"
+              : host.host_id === arcaHostId
+                ? "Arca instance"
+                : undefined
+          }
           action={
             reconnect ? (
               <span
@@ -6851,7 +6897,9 @@ export function NewChatLandingScreen() {
                                   <span className="flex size-4 shrink-0 items-center justify-center">
                                     <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                                   </span>
-                                  <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                                  <span className="text-sm">
+                                    {sandboxLabelForProvider(provider)}
+                                  </span>
                                 </span>
                               </DropdownMenuItem>
                             ))

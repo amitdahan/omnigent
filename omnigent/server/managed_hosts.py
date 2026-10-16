@@ -182,9 +182,9 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 from fastapi import HTTPException
 
-from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN, current_workspace_id
 from omnigent.db.utils import builtin_agent_id, now_epoch
-from omnigent.onboarding.sandboxes.base import SandboxGoneError
+from omnigent.onboarding.sandboxes.base import SandboxCapabilityError, SandboxGoneError
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -873,6 +873,8 @@ class ManagedSandboxDeployment:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                if launcher.capabilities.reusable_hosts:
+                    caps[config.provider]["reusable_hosts"] = True
                 from omnigent.inference_config import parse_inference_config
                 from omnigent.server.inference_catalog import ambient_gateway_providers
 
@@ -3519,6 +3521,53 @@ def _select_provider_config(
     return selected
 
 
+async def attach_sandbox_host(
+    *,
+    config: ManagedSandboxDeployment,
+    owner: str,
+    host_store: HostStore,
+    provider: str,
+    sandbox_id: str,
+    name: str,
+) -> str:
+    """Authorize and attach an existing box using the ordinary host wake path.
+
+    The stable identity makes retries reuse one registration. Ownership is
+    immutable and saved before any wake; startup failures never delete the box.
+    """
+    entry = _select_provider_config(config, provider)
+    launcher = entry.launcher_factory()
+    if launcher.provider != provider or not launcher.capabilities.resume_stopped:
+        raise HTTPException(400, "attachment requires a matching provider with resume support")
+    try:
+        await asyncio.to_thread(launcher.attach_for_user, sandbox_id, owner=owner)
+    except SandboxCapabilityError as exc:
+        raise HTTPException(400, exc.message) from exc
+    except PermissionError as exc:
+        raise HTTPException(403, "sandbox attachment not authorized") from exc
+    except click.ClickException as exc:
+        raise HTTPException(502, "sandbox attachment failed") from exc
+    host_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        repr(("omnigent-attachment", current_workspace_id(), provider, sandbox_id)),
+    ).hex
+    try:
+        host = await asyncio.to_thread(
+            host_store.reserve_sandbox_host,
+            host_id=host_id,
+            name=name,
+            user_id=owner,
+            provider=provider,
+            attached_sandbox_id=sandbox_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, "sandbox is already attached to another host owner") from exc
+    if host is None:
+        raise HTTPException(409, "host name or sandbox attachment conflicts with an existing host")
+    await resume_managed_host(host.host_id, host_store, config)
+    return host.host_id
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3581,6 +3630,9 @@ async def launch_managed_host(
     """
     entry = _select_provider_config(config, provider)
     launcher = entry.launcher_factory()
+    reusable = launcher.capabilities.reusable_hosts
+    if reusable and not launcher.capabilities.resume_stopped:
+        raise HTTPException(400, "reusable sandbox providers must support resume")
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
     host_id = host_id or uuid.uuid4().hex
@@ -3602,6 +3654,7 @@ async def launch_managed_host(
         host_name=host_name,
         owner=owner,
         sandbox_id=sandbox_id,
+        sandbox_attached=reusable,
         repos=repos,
         agent_name=agent_name,
         on_stage=on_stage,
@@ -3658,6 +3711,10 @@ async def relaunch_managed_host(
         longer matches the configured launcher; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
+    if host.sandbox_attached:
+        raise HTTPException(
+            409, "externally owned sandbox cannot be replaced; restore it with its provider"
+        )
     launcher = _launcher_for_teardown(host, config)
     if launcher is None:
         raise HTTPException(
@@ -3827,6 +3884,7 @@ async def _register_and_start_host(
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
     slice_key_enabled: bool = False,
+    sandbox_attached: bool = False,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -3864,6 +3922,8 @@ async def _register_and_start_host(
         cleanup terminates the new sandbox and revokes the token but
         keeps the host row. ``False`` (first launch) deletes the row.
     :param slice_key_enabled: Whether the host routes by its own id.
+    :param sandbox_attached: The provider created a reusable box it owns.
+        Startup failure revokes its token but retains the host for a retry.
     :returns: The absolute in-sandbox workspace path.
     :raises HTTPException: 502 when cloning, host startup, or
         registration fails.
@@ -3888,6 +3948,7 @@ async def _register_and_start_host(
                 host_store.register_managed_host,
                 host_id=host_id,
                 name=host_name,
+                sandbox_attached=sandbox_attached,
                 user_id=owner,
                 token=token,
                 provider=launcher.provider,
@@ -3916,7 +3977,10 @@ async def _register_and_start_host(
     except Exception as exc:
         # The provider allocated the sandbox before registration or startup
         # could fail, so both failures must attempt cleanup.
-        if record is None:
+        if sandbox_attached:
+            if record is not None:
+                await asyncio.to_thread(host_store.revoke_launch_token, host_id)
+        elif record is None:
             current = None
             try:
                 current = await asyncio.to_thread(host_store.get_host, host_id)
@@ -4183,6 +4247,8 @@ async def resume_managed_host(
             )
             if armed is None:
                 current = await asyncio.to_thread(host_store.get_host, host.host_id)
+                if host.sandbox_attached:
+                    raise HTTPException(409, "sandbox attachment changed while waking")
                 if current is None:
                     await _terminate_sandbox_best_effort(
                         launcher,
@@ -4220,7 +4286,11 @@ async def resume_managed_host(
                 agent_name=agent_name,
             )
             await _wait_for_host_online(host_store, host.host_id)
-        except SandboxGoneError:
+        except SandboxGoneError as exc:
+            if host.sandbox_attached:
+                raise HTTPException(
+                    409, "attached sandbox is gone; restore it with its provider"
+                ) from exc
             raise
         except Exception as exc:
             # An ordinary failed wake must NOT tear the sandbox down (the volume
@@ -4254,8 +4324,11 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
+    # Session cleanup must leave a reusable host and its other sessions intact.
+    if host.sandbox_attached:
+        return
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
-    if tombstone is None:
+    if tombstone is None or tombstone.sandbox_attached:
         return
     launcher = _launcher_for_teardown(tombstone, config)
     sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
