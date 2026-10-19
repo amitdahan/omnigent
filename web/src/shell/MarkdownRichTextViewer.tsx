@@ -21,8 +21,8 @@ import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-rea
 import { useEditor, EditorContent } from "@tiptap/react";
 import type { Transaction } from "@tiptap/pm/state";
 import { StarterKit } from "@tiptap/starter-kit";
-import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
-import { ListItem, TaskItem, TaskList } from "@tiptap/extension-list";
+import { TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
+import { ListItem, TaskItem } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -50,6 +50,8 @@ import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
 import { isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
+import { SoftBreak } from "./TipTapSoftBreak";
+import { BoundedTable, BoundedTaskList } from "./tiptapBoundedTokenizers";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -361,15 +363,18 @@ function MarkdownRichTextViewerInner({
       // built-in `- [ ]` marked tokenizer so the syntax parses into checkbox
       // items, and (b) round-trips back to identical markdown via their
       // built-in renderMarkdown. nested:true lets Tab indent sub-checklists.
-      TaskList,
+      BoundedTaskList,
       TaskItem.configure({ nested: true }),
-      Table.configure({ resizable: true }),
+      BoundedTable.configure({ resizable: true }),
       TableRow,
       TableCell,
       TableHeader,
       ImageAwareLink.configure({ openOnClick: false, autolink: false }),
       GitHubAlertBlockquote,
       HtmlPassthrough,
+      // Soft line breaks in hard-wrapped source render as spaces so Edit mode
+      // reflows prose to the viewer width like Preview; see TipTapSoftBreak.ts.
+      SoftBreak,
       Markdown,
       createWorkspaceImageExtension(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
