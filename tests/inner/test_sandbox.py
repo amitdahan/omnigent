@@ -476,6 +476,46 @@ def test_exec_launcher_prunes_inherited_env_to_spawn_allowlist(tmp_path) -> None
     assert child_env.get("PATH") == os.environ["PATH"]
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="bubblewrap is Linux-only")
+def test_run_launcher_keeps_resolved_proc_bind_after_env_pruning(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proc choice survives launcher environment pruning."""
+    from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setenv("OMNIGENT_HOST_SANDBOX_BACKEND", "kubernetes")
+    monkeypatch.setattr(
+        "omnigent.inner.bwrap_sandbox.shutil.which", lambda _name: "/usr/bin/bwrap"
+    )
+    policy = BwrapSandboxBackend().resolve(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        tmp_path,
+    )
+    policy = dataclasses.replace(policy, spawn_env_allowlist=["PATH"])
+    raw = json.dumps(policy.to_jsonable(), separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    captured: list[str] = []
+
+    def _capture_exec(_file: str, argv: list[str]) -> None:
+        captured.extend(argv)
+        raise SystemExit
+
+    monkeypatch.setattr("omnigent.inner.sandbox.create_private_tmpdir", lambda: scratch)
+    monkeypatch.setattr(os, "execvp", _capture_exec)
+
+    with pytest.raises(SystemExit):
+        run_launcher(encoded, sys.executable, ["-c", "pass"], cwd=str(tmp_path))
+
+    assert "OMNIGENT_HOST_SANDBOX_BACKEND" not in os.environ
+    assert any(
+        captured[index : index + 3] == ["--bind", "/proc", "/proc"]
+        for index in range(len(captured) - 2)
+    )
+
+
 def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
     """A policy with ``spawn_env_allowlist=None`` (spawner didn't opt
     in) must NOT prune — existing launcher users (claude-sdk, terminal)

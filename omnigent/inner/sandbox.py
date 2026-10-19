@@ -125,6 +125,9 @@ class SandboxPolicy:
         environment cannot leak it into the sandbox.
         ``None`` (the default) skips the prune for spawn sites that
         haven't opted in.
+    :param bind_host_proc: Whether bwrap should bind the outer ``/proc``
+        instead of mounting a fresh procfs. Resolved before launcher
+        environment pruning.
     :param egress_relay_port: TCP port the in-namespace relay listens
         on (loopback). Set when ``egress_rules`` is active; the helper
         starts a relay daemon on this port at activation time. C1
@@ -183,6 +186,7 @@ class SandboxPolicy:
     mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
+    bind_host_proc: bool = False
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
     git_ssh_socket_path: str | None = None
@@ -247,6 +251,7 @@ class SandboxPolicy:
                 if self.spawn_env_allowlist is not None
                 else None
             ),
+            "bind_host_proc": self.bind_host_proc,
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
             "git_ssh_socket_path": self.git_ssh_socket_path,
@@ -290,6 +295,8 @@ class SandboxPolicy:
         overflow = overflow_raw if isinstance(overflow_raw, str) else "warn"
         recursive_raw = data.get("cwd_hidden_scan_recursive", False)
         recursive = recursive_raw if isinstance(recursive_raw, bool) else False
+        bind_host_proc_raw = data.get("bind_host_proc", False)
+        bind_host_proc = bind_host_proc_raw if isinstance(bind_host_proc_raw, bool) else False
         mask_paths_data = data.get("mask_paths")
         mask_paths: list[Path] | None = None
         if isinstance(mask_paths_data, list):
@@ -349,6 +356,7 @@ class SandboxPolicy:
             mask_paths=mask_paths,
             env_passthrough=env_passthrough,
             spawn_env_allowlist=spawn_env_allowlist,
+            bind_host_proc=bind_host_proc,
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
             git_ssh_socket_path=git_ssh_socket_path,
@@ -844,6 +852,7 @@ def _clone_policy_with(
         spawn_env_allowlist=(
             list(policy.spawn_env_allowlist) if policy.spawn_env_allowlist is not None else None
         ),
+        bind_host_proc=policy.bind_host_proc,
         egress_relay_port=policy.egress_relay_port,
         egress_socket_path=policy.egress_socket_path,
         git_ssh_socket_path=policy.git_ssh_socket_path,

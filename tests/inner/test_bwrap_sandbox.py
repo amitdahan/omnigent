@@ -1110,10 +1110,7 @@ def test_detect_host_backend_marker_autodetects_lakebox(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    When no env var is set, the ``/run/lakebox`` marker directory
-    autodetects lakebox. This is the prune-proof fallback the re-exec
-    launcher path relies on (the env var may be stripped by the spawn
-    allow-list, but the filesystem marker survives).
+    Without an env declaration, the ``/run/lakebox`` marker detects lakebox.
     """
     marker = tmp_path / "run-lakebox"
     marker.mkdir()
@@ -1138,27 +1135,16 @@ def test_wrap_launcher_argv_fresh_proc_by_default(
     assert not _has_pair(argv, "--bind", "/proc", "/proc")
 
 
-def test_wrap_launcher_argv_binds_proc_on_lakebox(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_wrap_launcher_argv_binds_proc_when_resolved(tmp_path: Path) -> None:
     """
-    On a lakebox host the wrap binds the existing ``/proc`` instead of
-    mounting a fresh procfs (lakebox's masked ``/proc`` overmounts make
-    the fresh mount fail under ``--unshare-pid``). ``/dev`` and ``/tmp``
-    are unaffected.
+    A resolved proc-bind decision replaces the fresh procfs mount.
     """
-    _clear_host_backend_signals(monkeypatch, tmp_path)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "lakebox")
     backend = _make_backend()
     policy = _make_policy(tmp_path)
+    policy.bind_host_proc = True
     argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
-    assert _has_pair(argv, "--bind", "/proc", "/proc"), (
-        "lakebox host must bind the existing /proc; got no `--bind /proc /proc`."
-    )
-    assert not _has_pair_single_dest(argv, "--proc", "/proc"), (
-        "lakebox host must NOT also mount a fresh procfs — the two would "
-        "conflict at the same mountpoint."
-    )
+    assert _has_pair(argv, "--bind", "/proc", "/proc")
+    assert not _has_pair_single_dest(argv, "--proc", "/proc")
     assert _has_pair_single_dest(argv, "--dev", "/dev")
     assert "--tmpfs" in argv
 

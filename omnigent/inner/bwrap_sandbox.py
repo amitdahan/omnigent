@@ -200,16 +200,16 @@ _ALLOWED_SOCKET_FAMILIES = (
 # blocked even for same-uid targets and even as namespaced root, and
 # ``--unshare-pid`` still contains signalling. That leak is acceptable on a
 # single-tenant dev microVM (Lakebox) but not on an arbitrary host, so the
-# downgrade is only taken for vetted backends. Add entries here as more
-# backends are verified safe.
+# downgrade is only taken for vetted backends. Kubernetes launchers may
+# declare this only for single-tenant pods with isolated PID namespaces
+# (no ``hostPID`` or ``shareProcessNamespace``).
 _PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"kubernetes", "lakebox"})
 
 # Env var an outer launcher may set to name the host's outer sandbox
 # backend (e.g. ``lakebox``). Authoritative when present; otherwise the
-# backend is autodetected (see ``_detect_host_sandbox_backend``). Note it
-# must survive ``SandboxPolicy.spawn_env_allowlist`` pruning to be visible
-# on the re-exec launcher path — the marker autodetect below is the
-# prune-proof fallback that lakebox relies on today.
+# backend is autodetected (see ``_detect_host_sandbox_backend``). The
+# backend resolves this into ``SandboxPolicy.bind_host_proc`` before
+# launcher environment pruning.
 _HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 
 # Marker directory the Databricks Lakebox runtime seeds inside every
@@ -388,6 +388,7 @@ class BwrapSandboxBackend(SandboxBackend):
                 if sandbox_spec.env_passthrough is not None
                 else None
             ),
+            bind_host_proc=_should_bind_host_proc(),
             credential_proxy=sandbox_spec.credential_proxy,
             git_ssh=sandbox_spec.git_ssh,
         )
@@ -461,11 +462,11 @@ class BwrapSandboxBackend(SandboxBackend):
         #
         # ``--proc`` mounts a FRESH procfs tied to the new PID namespace so
         # the helper sees only its own processes. Some nested outer
-        # sandboxes (Lakebox) forbid that mount under ``--unshare-pid``
+        # sandboxes forbid that mount under ``--unshare-pid``
         # (masked ``/proc`` overmounts -> ``mount proc: EPERM``), so there
-        # we bind the host ``/proc`` instead. See ``_should_bind_host_proc``
-        # for the gate and the security trade-off.
-        if _should_bind_host_proc():
+        # we bind the outer ``/proc`` instead. The backend resolves this
+        # choice before launcher environment pruning.
+        if policy.bind_host_proc:
             bwrap_args += ["--bind", "/proc", "/proc"]
         else:
             bwrap_args += ["--proc", "/proc"]
