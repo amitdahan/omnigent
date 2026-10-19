@@ -84,13 +84,14 @@ _pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
-# non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
-# both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
+# non-interactive subprocess. ``body``, ``comments``, and ``reviews`` feed the
+# Summary and Comments tabs; the fork-fallback path shares the same fields.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
-    ",reviewRequests,latestReviews"
+    ",reviews,reviewRequests,latestReviews"
 )
 _PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
+_PR_COMMENTS_FIELD = "reviews"
 # Reading check runs needs the Checks permission, which a fine-grained personal
 # access token cannot hold; GitHub refuses just this field and ``gh`` fails the
 # whole call, so :func:`_gh_pr_view` retries without it.
@@ -402,8 +403,8 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     }
 
 
-# Cap the comments list so a very chatty PR can't bloat the payload; ``gh``
-# returns them oldest-first, so the cap keeps the earliest ``_MAX_COMMENTS``.
+# Cap the comments list so a very chatty PR can't bloat the payload; keep the
+# earliest comments after merging issue comments and review bodies.
 _MAX_COMMENTS = 100
 
 
@@ -446,21 +447,13 @@ def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
     return list(reviewers.values())
 
 
-def _shape_comments(raw: Any) -> list[dict[str, Any]]:
-    """Shape ``gh``'s PR ``comments`` into the Summary tab's comment list.
-
-    Keeps the top-level conversation comments GitHub shows by default: a
-    minimized/collapsed comment is dropped (mirroring the PR page). Each entry
-    is ``{author, body, created_at, url}``; the list is capped at
-    ``_MAX_COMMENTS``.
-    """
+def _shape_comments(
+    raw: Any, reviews: Any = None, *, pr_url: str | None = None
+) -> list[dict[str, Any]]:
+    """Merge PR conversation comments and submitted review bodies by timestamp."""
     shaped: list[dict[str, Any]] = []
-    if not isinstance(raw, list):
-        return shaped
-    for comment in raw:
-        if not isinstance(comment, dict):
-            continue
-        if comment.get("isMinimized"):
+    for comment in raw if isinstance(raw, list) else []:
+        if not isinstance(comment, dict) or comment.get("isMinimized"):
             continue
         author = comment.get("author")
         shaped.append(
@@ -471,9 +464,43 @@ def _shape_comments(raw: Any) -> list[dict[str, Any]]:
                 "url": comment.get("url") or None,
             }
         )
-        if len(shaped) >= _MAX_COMMENTS:
-            break
-    return shaped
+    for review in reviews if isinstance(reviews, list) else []:
+        if (
+            not isinstance(review, dict)
+            or not review.get("submittedAt")
+            or not str(review.get("body") or "").strip()
+        ):
+            continue
+        author = review.get("author")
+        shaped.append(
+            {
+                "author": author.get("login") if isinstance(author, dict) else None,
+                "body": review["body"],
+                "created_at": review.get("submittedAt") or None,
+                # gh's review objects have no URL; the PR conversation contains
+                # the review body, so link there rather than inventing an anchor.
+                "url": pr_url,
+            }
+        )
+    shaped.sort(key=lambda comment: comment["created_at"] or "")
+    return shaped[:_MAX_COMMENTS]
+
+
+def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
+    comments = data.get("comments")
+    reviews = data.get(_PR_COMMENTS_FIELD)
+    result: dict[str, Any] = {
+        "comments": _shape_comments(comments, reviews, pr_url=data.get("url"))
+    }
+    if (
+        not isinstance(comments, list)
+        or not isinstance(reviews, list)
+        or len(comments) >= _MAX_COMMENTS
+        or len(reviews) >= _MAX_COMMENTS
+        or len(comments) + len(reviews) > _MAX_COMMENTS
+    ):
+        result["comments_partial"] = True
+    return result
 
 
 def _head_commit_shas(root: str) -> list[str]:
@@ -596,7 +623,7 @@ def _gh_pr_view(
     rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
     while rc != 0:
         refused = _refused_pr_fields(err) & set(fields.split(","))
-        refused &= _PR_REVIEW_FIELDS | {_PR_CHECKS_FIELD}
+        refused &= _PR_REVIEW_FIELDS | {_PR_CHECKS_FIELD, _PR_COMMENTS_FIELD}
         if refused & _PR_REVIEW_FIELDS:
             refused.update(_PR_REVIEW_FIELDS)
         remaining = ",".join(field for field in fields.split(",") if field not in refused)
@@ -723,10 +750,9 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             "base_ref": data.get("baseRefName"),
             "head_ref": data.get("headRefName"),
             **_checks_fields(data),
-            # PR description + conversation comments feed the Summary tab; an
-            # empty body is null so the UI shows its "no description" state.
+            # An empty body is null so the Summary tab shows its empty state.
             "body": body if isinstance(body, str) and body.strip() else None,
-            "comments": _shape_comments(data.get("comments")),
+            **_comments_payload(data),
         }
         if _PR_REVIEW_FIELDS.issubset(data):
             payload["pr"]["reviewers"] = _shape_reviewers(data)
@@ -829,7 +855,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "base_sha": data.get("baseRefOid"),
         **_checks_fields(data),
         "body": data.get("body") or None,
-        "comments": _shape_comments(data.get("comments")),
+        **_comments_payload(data),
     }
     if _PR_REVIEW_FIELDS.issubset(data):
         info["pr"]["reviewers"] = _shape_reviewers(data)
