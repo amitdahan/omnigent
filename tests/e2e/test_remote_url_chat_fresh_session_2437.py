@@ -45,6 +45,7 @@ from tests._helpers.live_server import (
     isolated_process_env,
     terminate_process,
 )
+from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
@@ -191,6 +192,9 @@ def _assistant_text(base_url: str, session_id: str) -> str:
 
 def test_repl_adapter_creates_session_without_bundle(
     registered_agent_server: _RegisteredAgentServer,
+    tmp_path: Path,
+    mock_llm_server_url: str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The REPL adapter creates a session by agent_id when it has no bundle.
 
@@ -205,15 +209,40 @@ def test_repl_adapter_creates_session_without_bundle(
     """
     from omnigent_client import OmnigentClient
 
+    from omnigent.chat import _bundle_agent, _pick_agent
     from omnigent.repl._repl import _SessionsChatReplAdapter
 
     server = registered_agent_server
+    registered_id = server.agent_id()
+    local_spec = _write_agent_yaml(
+        tmp_path,
+        agent_name=server.agent_name,
+        model="mock-unused-upload",
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    with server.client() as http:
+        uploaded = post_session_bundle(
+            http.post,
+            "/v1/sessions",
+            _bundle_agent(local_spec),
+            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        assert uploaded.json()["agent_id"] != registered_id
+    monkeypatch.setattr("click.prompt", lambda *_args, **_kwargs: server.agent_name)
+    selected = _pick_agent(server.base_url)
+    assert selected.id == registered_id
+
+    async def _unexpected_lookup(_name: str) -> object:
+        raise AssertionError("the selected catalog entry must not be resolved again")
 
     async def _drive() -> str:
         async with OmnigentClient(base_url=server.base_url) as client:
+            monkeypatch.setattr(client.sessions, "resolve_agent", _unexpected_lookup)
             adapter = _SessionsChatReplAdapter(
                 client=client,
                 agent_name=server.agent_name,
+                registered_agent=selected,
                 session_bundle=None,
                 session_id=None,
                 runner_id=None,
@@ -580,6 +609,12 @@ def test_run_one_shot_on_fresh_server_asks_for_agent_then_answers_with_it(
     assert server.marker in proc.stdout, proc.stdout + proc.stderr
     assert _session_count(server.base_url) == 1
 
+    proc = _run_cli(tmp_path / "cli-home", "run", "--server", server.base_url, "-p", "hi")
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "--agent <name>" in output and server.agent_name in output, output
+    assert _session_count(server.base_url) == 1
+
 
 def test_run_one_shot_without_online_runner_fails_cleanly(tmp_path: Path) -> None:
     """A server with no online runner yields a CLI error, not a crash screen."""
@@ -588,18 +623,11 @@ def test_run_one_shot_without_online_runner_fails_cleanly(tmp_path: Path) -> Non
         extra_args=["--agent", str(_REPO_ROOT / "examples" / "scribe")],
     ) as base_url:
         with httpx.Client(base_url=base_url, timeout=30.0) as client:
-            agents = client.get("/v1/agents", params={"limit": 100}).json()["data"]
-            agent_id = next(a["id"] for a in agents if a["name"] == "scribe")
-            # Give agent discovery something to find, so the run reaches the runner check.
-            resp = client.post(
-                "/v1/sessions",
-                json={"agent_id": agent_id},
-                headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
-            )
-            resp.raise_for_status()
             assert client.get("/v1/runners").json()["data"] == []
 
-        proc = _run_cli(tmp_path / "cli-home", "run", "--server", base_url, "-p", "hi")
+        proc = _run_cli(
+            tmp_path / "cli-home", "run", "--server", base_url, "--agent", "scribe", "-p", "hi"
+        )
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output

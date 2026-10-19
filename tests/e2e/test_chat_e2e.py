@@ -322,6 +322,7 @@ def test_chat_local_accepts_omnigent_yaml_file(
 def test_chat_remote_pick_agent(
     mock_llm_server_url: str | None,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Remote chat can list and identify agents on a server.
@@ -359,19 +360,15 @@ def test_chat_remote_pick_agent(
     try:
         _wait_for_server(port, server)
 
-        # Create a session so _pick_agent can discover the agent name
-        # from GET /v1/sessions (which it uses to list agent names).
-        client = httpx.Client(base_url=base_url, timeout=30.0)
-        _create_runner_bound_session_for_builtin(
-            client,
-            agent_name=agent_name,
-            runner_id=server.runner_id or "",
-        )
+        with httpx.Client(base_url=base_url, timeout=30.0) as client:
+            agent_id = _lookup_builtin_agent_id(client, agent_name)
+            sessions = client.get("/v1/sessions", params={"visibility": "all"})
+            sessions.raise_for_status()
+            assert sessions.json()["data"] == []
 
-        # _pick_agent auto-selects when there's only one agent.
+        monkeypatch.setattr("click.prompt", lambda *_args, **_kwargs: agent_name)
         picked = _pick_agent(base_url)
-        assert picked == agent_name, (
-            f"Expected _pick_agent to return {agent_name!r}, got {picked!r}."
-        )
+        assert picked.name == agent_name
+        assert picked.id == agent_id
     finally:
         _stop_local_server(server)

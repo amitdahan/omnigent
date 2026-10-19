@@ -1299,6 +1299,7 @@ class _SessionsChatReplAdapter:
         field_input_state: _FieldInputState | None = None,
         host: TerminalHost | None = None,
         fmt: RichBlockFormatter | None = None,
+        registered_agent: RegisteredAgent | None = None,
     ) -> None:
         """
         Wire the adapter; do NOT issue any HTTP calls.
@@ -1345,9 +1346,11 @@ class _SessionsChatReplAdapter:
             field values interactively via the main input loop.
         :param host: Terminal output channel for rendering field prompts.
         :param fmt: Formatter for styling field prompts.
+        :param registered_agent: Catalog identity selected for a new remote session.
         """
         self._client = client
         self._agent_id: str | None = None
+        self._registered_agent = registered_agent
         self._agent_name = agent_name
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
@@ -1731,8 +1734,8 @@ class _SessionsChatReplAdapter:
         """
         Create a session bound to an agent already registered server-side.
 
-        The remote-URL path: there is no local bundle to upload, so
-        resolve the picked name to its id and use the JSON create route.
+        The remote-URL path: there is no local bundle to upload, so use
+        the selected catalog identity or resolve the name for direct callers.
         A remote client also has no runner of its own, so adopt one the
         server already has online — otherwise the first turn fails the
         runner-binding precondition.
@@ -1748,8 +1751,8 @@ class _SessionsChatReplAdapter:
             )
         # Skip the name lookup only when nothing needs it: we already know
         # the id, and a bound runner means we don't need the harness either.
-        agent: RegisteredAgent | None = None
-        if self._agent_id is None or self._runner_id is None:
+        agent = self._registered_agent if self._agent_id is None else None
+        if agent is None and (self._agent_id is None or self._runner_id is None):
             try:
                 agent = await self._client.sessions.resolve_agent(self._agent_name)
             except LookupError as exc:
@@ -3194,11 +3197,13 @@ async def run_repl(
     agent_description: str | None = None,
     used_families: list[str] | None = None,
     attach_only: bool = False,
+    registered_agent: RegisteredAgent | None = None,
 ) -> str | None:
     """The entire REPL — using the framework.
 
     :param client: Connected OmnigentClient.
     :param agent_name: Agent name (used for API calls).
+    :param registered_agent: Catalog identity selected for a new remote session.
     :param tool_handler: Optional client-side tool handler.
     :param initial_message: If set, auto-send this message on startup
         (e.g. a greeting prompt for onboarding).
@@ -3369,6 +3374,7 @@ async def run_repl(
     session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
+        registered_agent=registered_agent,
         tool_callables=tool_callables,
         hooks=hooks,
         session_id=resume_conversation_id,

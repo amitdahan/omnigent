@@ -454,7 +454,8 @@ def run_chat(
             initial_message=prompt,
             resume_conversation_id=resume_conversation_id,
             fork_session_id=fork_session_id,
-            agent_name=selected_agent,
+            agent_name=selected_agent.name if selected_agent is not None else None,
+            registered_agent=selected_agent,
             debug_events=debug_events,
             resume_parts=resume_parts,
             skills=host_skills or None,
@@ -566,9 +567,10 @@ def run_prompt(
         )
         _run_headless_prompt(
             base_url,
-            selected_agent,
+            selected_agent.name,
             tool_handler,
             prompt=prompt,
+            registered_agent=selected_agent,
         )
         return
 
@@ -994,6 +996,7 @@ def _chat_with_server(
     resume_conversation_id: str | None = None,
     fork_session_id: str | None = None,
     agent_name: str | None = None,
+    registered_agent: RegisteredAgent | None = None,
     runner_id: str | None = None,
     runner_recover: Callable[[], str] | None = None,
     log: bool = False,
@@ -1031,6 +1034,7 @@ def _chat_with_server(
         entering the REPL. The REPL opens attached to the fork.
     :param agent_name: Optional already-selected agent name,
         e.g. ``"hello_world"``.
+    :param registered_agent: Catalog identity selected for a new remote session.
     :param runner_id: Optional preferred runner id to send on
         requests, e.g. ``"runner_0123456789abcdef"``.
     :param runner_recover: Optional callback that restarts a local
@@ -1122,7 +1126,11 @@ def _chat_with_server(
             )
     # A headless one-shot cannot answer the agent menu, so it fails with the
     # candidates instead.
-    selected_agent = agent_name or _pick_agent(base_url, interactive=initial_message is None)
+    if agent_name is None:
+        selected = _pick_agent(base_url, interactive=initial_message is None)
+        agent_name = selected.name
+        if resume_conversation_id is None and fork_session_id is None:
+            registered_agent = selected
 
     # Bring-up is done — clear the spinner the instant before we produce
     # terminal output (the one-shot reply or the REPL's first paint), so it
@@ -1133,7 +1141,8 @@ def _chat_with_server(
     if initial_message is not None:
         _run_one_shot(
             base_url=base_url,
-            agent_name=selected_agent,
+            agent_name=agent_name,
+            registered_agent=registered_agent,
             tool_handler=tool_handler,
             prompt=initial_message,
             runner_id=runner_id,
@@ -1146,8 +1155,9 @@ def _chat_with_server(
 
     _run_repl(
         base_url,
-        selected_agent,
+        agent_name,
         tool_handler,
+        registered_agent=registered_agent,
         initial_message=initial_message,
         resume_conversation_id=resume_conversation_id,
         fork_session_id=fork_session_id,
@@ -1514,16 +1524,12 @@ def _listing_items(
     return [item for item in data if isinstance(item, dict)]
 
 
-def _session_agent_names(base_url: str) -> list[str]:
-    """Return the distinct agent names of the server's existing sessions."""
-    names: list[str] = []
-    # custom-lint: disable-next=session-list-visibility -- params below carry visibility=all
-    listing = _discovery_get(base_url, "/v1/sessions", {"limit": 100, "visibility": "all"})
-    for session in _listing_items(listing, base_url, "/v1/sessions"):
-        name = session.get("agent_name")
-        if isinstance(name, str) and name and name not in names:
-            names.append(name)
-    return names
+@dataclass(frozen=True, kw_only=True)
+class _AgentChoice(RegisteredAgent):
+    """A catalog entry whose identity survives the CLI's display-name picker."""
+
+    name: str
+    source: str
 
 
 #: Most agent names an error message spells out before summarizing the rest.
@@ -1537,11 +1543,11 @@ def _format_agent_names(names: list[str]) -> str:
     return f"{shown} (and {hidden} more)" if hidden > 0 else shown
 
 
-def _server_agent_names(
+def _server_agents(
     base_url: str, *, stop_at: str | None = None, scope: str | None = None
-) -> list[str]:
+) -> list[_AgentChoice]:
     """
-    Return the names of the agents registered on the server.
+    Return selectable catalog entries, retaining their ids and harnesses.
 
     Walks ``GET /v1/agents``, the same listing ``resolve_agent`` binds a new
     session against, so every name returned here can start a session.
@@ -1549,12 +1555,12 @@ def _server_agent_names(
     :param base_url: Server base URL.
     :param stop_at: Stop paging as soon as this name is seen, e.g. ``"scribe"``.
     :param scope: ``"user"`` to list the caller's own agents instead.
-    :returns: Registered agent names in listing order; only the pages read so
+    :returns: Registered agents in listing order; only the pages read so
         far when *stop_at* was found early.
     :raises click.ClickException: If the server is unreachable or the listing
         reports more agents without a usable cursor.
     """
-    names: list[str] = []
+    agents: list[_AgentChoice] = []
     seen: set[str] = set()
     after: str | None = None
     while True:
@@ -1566,11 +1572,26 @@ def _server_agent_names(
         page = _discovery_get(base_url, "/v1/agents", params)
         for item in _listing_items(page, base_url, "/v1/agents"):
             name = item.get("name")
-            if isinstance(name, str) and name and name not in seen:
+            agent_id = item.get("id")
+            harness = item.get("harness")
+            if (
+                isinstance(name, str)
+                and name
+                and name not in seen
+                and isinstance(agent_id, str)
+                and agent_id
+            ):
                 seen.add(name)
-                names.append(name)
+                agents.append(
+                    _AgentChoice(
+                        id=agent_id,
+                        name=name,
+                        harness=harness if isinstance(harness, str) else None,
+                        source=scope or "server",
+                    )
+                )
         if (stop_at is not None and stop_at in seen) or not page.get("has_more"):
-            return names
+            return agents
         last_id = page.get("last_id")
         if not last_id or last_id == after:
             raise _discovery_error(
@@ -1579,19 +1600,25 @@ def _server_agent_names(
         after = last_id
 
 
-def _registered_agent_names(base_url: str, *, stop_at: str | None = None) -> list[str]:
+def _registered_agents(base_url: str, *, stop_at: str | None = None) -> list[_AgentChoice]:
     """Agents a new session can start with: server agents, then the caller's own."""
-    names = _server_agent_names(base_url, stop_at=stop_at)
-    if stop_at is not None and stop_at in names:
-        return names
+    agents = _server_agents(base_url, stop_at=stop_at)
+    if stop_at is not None and any(agent.name == stop_at for agent in agents):
+        return agents
     try:
-        # The caller's own agents are optional: an older, forbidden or failing
-        # listing contributes none.
-        user_names = _server_agent_names(base_url, scope="user")
-    except click.ClickException:
-        user_names = []
-    seen = set(names)
-    return names + [name for name in user_names if name not in seen]
+        user_agents = _server_agents(base_url, scope="user", stop_at=stop_at)
+    except click.ClickException as exc:
+        cause = exc.__cause__
+        if not isinstance(cause, httpx.HTTPStatusError) or cause.response.status_code not in (
+            401,
+            403,
+            404,
+            422,
+        ):
+            raise
+        user_agents = []
+    seen = {agent.name for agent in agents}
+    return agents + [agent for agent in user_agents if agent.name not in seen]
 
 
 def _server_setup_error(message: str) -> click.ClickException:
@@ -1614,19 +1641,21 @@ def _no_registered_agents_message(base_url: str) -> str:
     )
 
 
-def _require_registered_agent(base_url: str, agent_name: str) -> str:
+def _require_registered_agent(base_url: str, agent_name: str) -> _AgentChoice:
     """
     Check that *agent_name* (``--agent``) is registered on the server.
 
     :param base_url: Server base URL.
     :param agent_name: Agent name the user asked for, e.g. ``"scribe"``.
-    :returns: *agent_name* unchanged.
+    :returns: The matching catalog entry, including its id and harness.
     :raises click.ClickException: If the server is unreachable or no
         registered agent has that name.
     """
-    names = _registered_agent_names(base_url, stop_at=agent_name)
-    if agent_name in names:
-        return agent_name
+    agents = _registered_agents(base_url, stop_at=agent_name)
+    for agent in agents:
+        if agent.name == agent_name:
+            return agent
+    names = [agent.name for agent in agents]
     if not names:
         raise _server_setup_error(_no_registered_agents_message(base_url))
     from omnigent.util.server_url import display_server_url
@@ -1638,54 +1667,57 @@ def _require_registered_agent(base_url: str, agent_name: str) -> str:
     )
 
 
-def _pick_agent(base_url: str, *, quiet: bool = False, interactive: bool = True) -> str:
+def _pick_agent(base_url: str, *, quiet: bool = False, interactive: bool = True) -> _AgentChoice:
     """
     Choose the registered agent a new ``--server`` session should use.
 
-    Agent names come from the server's existing sessions (the agents already
-    used there) and, when it has none yet, from the agents registered on the
-    server. A single candidate is selected automatically; several are offered
-    as a menu, or rejected with the list when no prompt is allowed.
+    Only registered server and user agents are candidates for a new session.
+    Session-scoped uploads from conversation history are not catalog entries.
+    A single candidate is selected automatically; several are offered as a
+    menu, or rejected with the list when no prompt is allowed.
 
     :param base_url: Server base URL.
     :param quiet: When ``True``, suppress the ``Agent:`` echo and never prompt.
     :param interactive: When ``False`` (headless ``-p``), fail with the
         candidate list instead of prompting when several agents qualify.
-    :returns: The chosen agent name.
+    :returns: The selected catalog entry, including its id and harness.
     :raises click.ClickException: If the server is unreachable, no agent is
         registered, or several qualify and no prompt is allowed.
     """
-    names = _session_agent_names(base_url) or _registered_agent_names(base_url)
-    if not names:
+    agents = _registered_agents(base_url)
+    if not agents:
         raise _server_setup_error(_no_registered_agents_message(base_url))
 
-    if len(names) == 1:
+    if len(agents) == 1:
         if not quiet:
-            click.echo(f"\n  Agent: {printable(names[0])}")
-        return names[0]
+            click.echo(f"\n  Agent: {printable(agents[0].name)}")
+        return agents[0]
 
     if quiet or not interactive:
         from omnigent.util.server_url import display_server_url
 
+        names = _format_agent_names([agent.name for agent in agents])
         raise _server_setup_error(
             f"Several agents are available on {display_server_url(base_url)}; pass "
-            f"--agent <name> to choose one: {_format_agent_names(names)}."
+            f"--agent <name> to choose one: {names}."
         )
 
     click.echo("\n  Available agents:\n")
-    for i, name in enumerate(names, 1):
-        click.echo(f"    {i}. {printable(name)}")
+    for index, agent in enumerate(agents, 1):
+        details = f"{agent.source}, {printable(agent.harness or 'unknown harness')}"
+        click.echo(f"    {index}. {printable(agent.name)} ({details})")
 
     while True:
         raw = str(click.prompt("\n  Agent", default="1"))
         try:
             choice = int(raw)
-            if 1 <= choice <= len(names):
-                return names[choice - 1]
+            if 1 <= choice <= len(agents):
+                return agents[choice - 1]
         except ValueError:
-            if raw.strip() in names:
-                return raw.strip()
-        click.echo(f"  Enter a number between 1 and {len(names)}.")
+            for agent in agents:
+                if raw.strip() == agent.name:
+                    return agent
+        click.echo(f"  Enter a number between 1 and {len(agents)}.")
 
 
 # ---------------------------------------------------------------------------
@@ -2508,6 +2540,7 @@ def _run_headless_prompt(
     runner_id: str | None = None,
     session_bundle: bytes | None = None,
     session_bundle_filename: str = "agent.tar.gz",
+    registered_agent: RegisteredAgent | None = None,
 ) -> None:
     """
     POST one prompt through the SDK and print the final assistant text.
@@ -2527,6 +2560,7 @@ def _run_headless_prompt(
     :param session_bundle: Optional gzipped agent bundle bytes.
     :param session_bundle_filename: Multipart filename, e.g.
         ``"agent.tar.gz"``.
+    :param registered_agent: Catalog identity selected before opening the SDK client.
     :raises SystemExit: Exits with code 1 after printing the server
         error text when the stream emits ``response.error`` or
         returns ``ResponseFailed`` without output text.
@@ -2550,6 +2584,7 @@ def _run_headless_prompt(
                 session_bundle=session_bundle,
                 session_bundle_filename=session_bundle_filename,
                 runner_id=runner_id,
+                registered_agent=registered_agent,
             )
             if result_text:
                 print(result_text)
@@ -2585,6 +2620,7 @@ async def _query_sessions_once(
     runner_id: str | None,
     resume_conversation_id: str | None = None,
     on_session_ready: Callable[[str], None] | None = None,
+    registered_agent: RegisteredAgent | None = None,
 ) -> str | None:
     """
     Create or resume a sessions-API session, get it a runner, and query it for ``-p``.
@@ -2607,6 +2643,7 @@ async def _query_sessions_once(
         ``"conv_abc123"``. ``None`` creates a fresh session.
     :param on_session_ready: Optional callback invoked after the
         session has been created/resumed and bound to the runner.
+    :param registered_agent: Selected catalog identity; avoids another name lookup.
     :returns: Final assistant text, or ``None`` when no text was
         emitted.
     :raises click.ClickException: If the remote server has no online
@@ -2618,7 +2655,7 @@ async def _query_sessions_once(
     # Remote target: no local bundle means no local runner either, so
     # adopt one the server already has online, or have a host launch one,
     # before the dispatch precondition is checked.
-    agent: RegisteredAgent | None = None
+    agent = registered_agent if resume_conversation_id is None and session_bundle is None else None
     resumed: SessionSnapshot | None = None
     launch_host_id: str | None = None
     if runner_id is None and session_bundle is None:
@@ -2632,7 +2669,7 @@ async def _query_sessions_once(
                 with contextlib.suppress(LookupError, ClientOmnigentError):
                     harness = (await client.sessions.resolve_agent(resumed.agent_name)).harness
         else:
-            agent = await _resolve_remote_agent(client, agent_name)
+            agent = agent or await _resolve_remote_agent(client, agent_name)
             harness = agent.harness
         runner_id = await client.sessions.resolve_online_runner(
             harness=harness,
@@ -4264,6 +4301,7 @@ def _run_repl(
     auto_open_conversation: bool = False,
     attach_only: bool = False,
     attach_harness: str | None = None,
+    registered_agent: RegisteredAgent | None = None,
 ) -> None:
     """
     Open the REPL connected to the server.
@@ -4328,6 +4366,7 @@ def _run_repl(
         ``None`` (default) means no skill commands are registered.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL when the session id becomes known.
+    :param registered_agent: Catalog identity selected for a new remote session.
     """
     from omnigent.repl import run_repl
     from omnigent.repl._session_log import DEFAULT_LOG_DIR
@@ -4453,6 +4492,7 @@ def _run_repl(
                 agent_description=agent_description,
                 used_families=used_families,
                 attach_only=attach_only,
+                registered_agent=registered_agent,
                 on_session_start=(
                     lambda session_id: _on_session_known(
                         base_url=base_url,
@@ -4477,6 +4517,7 @@ def _run_one_shot(
     session_bundle_filename: str = "agent.tar.gz",
     resume_conversation_id: str | None = None,
     auto_open_conversation: bool = False,
+    registered_agent: RegisteredAgent | None = None,
 ) -> None:
     """
     Send a single prompt to a remote server and print the final text.
@@ -4497,6 +4538,7 @@ def _run_one_shot(
         ``"conv_abc123"``. ``None`` creates a fresh session.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is created or resumed.
+    :param registered_agent: Catalog identity selected for a new remote session.
     :returns: None.
     """
 
@@ -4519,6 +4561,7 @@ def _run_one_shot(
                 session_bundle_filename=session_bundle_filename,
                 runner_id=runner_id,
                 resume_conversation_id=resume_conversation_id,
+                registered_agent=registered_agent,
                 on_session_ready=(
                     lambda session_id: _on_session_known(
                         base_url=base_url,

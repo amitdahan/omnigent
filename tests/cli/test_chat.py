@@ -892,6 +892,7 @@ def test_chat_remote_prompt_uses_one_shot_not_repl(
         session_bundle_filename: str = "agent.tar.gz",
         resume_conversation_id: str | None = None,
         auto_open_conversation: bool = False,
+        registered_agent: RegisteredAgent | None = None,
     ) -> None:
         """Record one-shot query inputs."""
         del (
@@ -899,6 +900,7 @@ def test_chat_remote_prompt_uses_one_shot_not_repl(
             session_bundle_filename,
             resume_conversation_id,
             auto_open_conversation,
+            registered_agent,
         )
         calls["one_shot"] = (
             base_url,
@@ -1888,13 +1890,13 @@ def test_pick_agent_offers_registered_agents_when_no_sessions_exist(
 ) -> None:
     """A server with registered agents but no sessions yet is not an error.
 
-    Discovery falls back to ``GET /v1/agents`` and auto-selects a lone agent.
+    Discovery queries ``GET /v1/agents`` and auto-selects a lone agent.
     """
     requests = _serve_listings(monkeypatch, sessions=[], agent_pages=[_agents_page(["scribe"])])
 
-    assert _pick_agent("http://127.0.0.1:6767") == "scribe"
+    assert _pick_agent("http://127.0.0.1:6767").name == "scribe"
 
-    assert requests == [("sessions", None), ("agents", None)]
+    assert requests == [("agents", None)]
     assert "Agent: scribe" in capsys.readouterr().out
 
 
@@ -1913,7 +1915,7 @@ def test_pick_agent_follows_agent_listing_pages(monkeypatch: pytest.MonkeyPatch)
         _pick_agent("http://127.0.0.1:6767", interactive=False)
 
     assert "coder, scribe" in str(excinfo.value)
-    assert requests == [("sessions", None), ("agents", None), ("agents", "ag_coder")]
+    assert requests == [("agents", None), ("agents", "ag_coder")]
 
 
 @pytest.mark.parametrize(
@@ -1947,7 +1949,7 @@ def test_require_registered_agent_stops_paging_once_the_name_is_found(
         agent_pages=[_agents_page(["scribe"], has_more=True, last_id="ag_scribe")],
     )
 
-    assert _require_registered_agent("http://127.0.0.1:6767", "scribe") == "scribe"
+    assert _require_registered_agent("http://127.0.0.1:6767", "scribe").id == "ag_scribe"
 
     assert requests == [("agents", None)]
 
@@ -1983,21 +1985,61 @@ def test_pick_agent_rejects_a_listing_without_a_data_list(
 
 def test_pick_agent_skips_malformed_listing_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     """Rows that are not objects or lack a string name are ignored, as the SDK resolver does."""
-    rows = [None, {"id": "ag_x"}, {"name": 7}, {"name": "scribe"}]
+    rows = [None, {"id": "ag_x"}, {"name": 7}, {"name": "no-id"}, {"name": "scribe", "id": "ag_s"}]
     _serve_listings(
         monkeypatch, sessions=[], agent_pages=[{"data": rows, "has_more": False, "last_id": None}]
     )
 
-    assert _pick_agent("http://127.0.0.1:6767", quiet=True) == "scribe"
+    assert _pick_agent("http://127.0.0.1:6767", quiet=True).id == "ag_s"
 
 
-def test_pick_agent_prefers_agents_with_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Existing sessions still drive discovery; the registry is only the fallback."""
-    requests = _serve_listings(monkeypatch, sessions=[{"agent_name": "used"}], agent_pages=[])
+def test_pick_agent_includes_unused_registered_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Conversation history must not hide agents available for a new session."""
+    requests = _serve_listings(
+        monkeypatch,
+        sessions=[{"agent_name": "used"}],
+        agent_pages=[_agents_page(["used", "unused"])],
+    )
 
-    assert _pick_agent("http://127.0.0.1:6767", quiet=True) == "used"
+    with pytest.raises(click.ClickException, match="used, unused"):
+        _pick_agent("http://127.0.0.1:6767", quiet=True)
 
-    assert requests == [("sessions", None)]
+    assert requests == [("agents", None)]
+
+
+def test_pick_agent_keeps_catalog_identity_instead_of_uploaded_session_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-named local upload is not the registered agent selected for a new session."""
+    requests = _serve_listings(
+        monkeypatch,
+        sessions=[{"agent_name": "reviewer", "agent_id": "ag_local_upload"}],
+        agent_pages=[
+            {"data": [{"name": "reviewer", "id": "ag_template", "harness": "openai-agents"}]}
+        ],
+    )
+
+    selected = _pick_agent("http://127.0.0.1:6767", quiet=True)
+
+    assert selected.name == "reviewer"
+    assert selected.id == "ag_template"
+    assert selected.harness == "openai-agents"
+    assert requests == [("agents", None)]
+
+
+def test_pick_agent_does_not_offer_unregistered_session_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session-scoped upload cannot be selected as a registered template."""
+    _serve_listings(
+        monkeypatch,
+        sessions=[{"agent_name": "local-only"}],
+        agent_pages=[_agents_page(["registered"])],
+    )
+
+    selected = _pick_agent("http://127.0.0.1:6767", quiet=True)
+
+    assert selected.name == "registered"
 
 
 @pytest.mark.parametrize("kwargs", [{"interactive": False}, {"quiet": True}])
@@ -2062,14 +2104,19 @@ def test_chat_with_server_only_prompts_for_an_agent_when_it_can(
     """A headless one-shot that starts a new session never blocks on the agent menu."""
     picked: dict[str, bool] = {}
 
-    def _fake_pick(base_url: str, *, quiet: bool = False, interactive: bool = True) -> str:
+    def _fake_pick(
+        base_url: str, *, quiet: bool = False, interactive: bool = True
+    ) -> chat_module._AgentChoice:
         picked["interactive"] = interactive
-        return "scribe"
+        return chat_module._AgentChoice(id="ag_scribe", name="scribe", source="server")
 
     monkeypatch.setattr(chat_module, "_pick_agent", _fake_pick)
     monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
-    monkeypatch.setattr(chat_module, "_run_one_shot", lambda **_kw: None)
-    monkeypatch.setattr(chat_module, "_run_repl", lambda *_args, **_kw: None)
+    dispatched: dict[str, object] = {}
+    monkeypatch.setattr(chat_module, "_run_one_shot", lambda **kwargs: dispatched.update(kwargs))
+    monkeypatch.setattr(
+        chat_module, "_run_repl", lambda *_args, **kwargs: dispatched.update(kwargs)
+    )
 
     chat_module._chat_with_server(
         "http://127.0.0.1:6767",
@@ -2079,6 +2126,8 @@ def test_chat_with_server_only_prompts_for_an_agent_when_it_can(
     )
 
     assert picked["interactive"] is expected_interactive
+    selected = dispatched["registered_agent"]
+    assert isinstance(selected, RegisteredAgent) and selected.id == "ag_scribe"
 
 
 def _resume_lookup(body: dict[str, object]) -> Callable[..., dict[str, object]]:
@@ -2199,9 +2248,11 @@ def test_chat_with_server_interactive_resume_without_session_agent_offers_the_me
     monkeypatch.setattr(chat_module, "_discovery_get", _resume_lookup({"id": "conv_1"}))
     picked: dict[str, bool] = {}
 
-    def _fake_pick(base_url: str, *, quiet: bool = False, interactive: bool = True) -> str:
+    def _fake_pick(
+        base_url: str, *, quiet: bool = False, interactive: bool = True
+    ) -> chat_module._AgentChoice:
         picked["interactive"] = interactive
-        return "scribe"
+        return chat_module._AgentChoice(id="ag_scribe", name="scribe", source="server")
 
     monkeypatch.setattr(chat_module, "_pick_agent", _fake_pick)
     monkeypatch.setattr(chat_module, "_run_repl", lambda *_args, **_kw: None)
@@ -2220,17 +2271,17 @@ def test_pick_agent_menu_accepts_a_typed_name(
     _serve_listings(monkeypatch, sessions=[], agent_pages=[_agents_page(["coder", "scribe"])])
     monkeypatch.setattr("sys.stdin", io.StringIO("scribe\n"))
 
-    assert _pick_agent("http://127.0.0.1:6767") == "scribe"
+    assert _pick_agent("http://127.0.0.1:6767").id == "ag_scribe"
 
     out = capsys.readouterr().out
     assert "Available agents" in out and "2. scribe" in out
 
 
-@pytest.mark.parametrize("failing_route", ["/v1/sessions", "/v1/agents"])
 def test_pick_agent_reports_a_failed_listing_as_a_cli_error(
-    monkeypatch: pytest.MonkeyPatch, failing_route: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An HTTP error from either discovery listing is a clean CLI error, hint withheld."""
+    """An HTTP error from the catalog is a clean CLI error, hint withheld."""
+    failing_route = "/v1/agents"
 
     def _get(url: str, **_kwargs: object) -> SimpleNamespace:
         if not url.endswith(failing_route):
@@ -2268,7 +2319,7 @@ def test_pick_agent_reports_a_listing_that_times_out_as_a_cli_error(
         _pick_agent("http://127.0.0.1:6767")
 
     message = str(excinfo.value)
-    assert "/v1/sessions" in message and "ReadTimeout" in message
+    assert "/v1/agents" in message and "ReadTimeout" in message
     assert suppresses_recovery_hint(excinfo.value)
 
 
@@ -2308,7 +2359,8 @@ def test_pick_agent_reports_an_unusable_agent_listing_as_a_cli_error(
 
 def test_run_prompt_url_target_runs_the_requested_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     """The headless entry point can name the agent instead of discovering one."""
-    monkeypatch.setattr(chat_module, "_require_registered_agent", lambda _base_url, name: name)
+    selected = chat_module._AgentChoice(id="ag_scribe", name="scribe", source="server")
+    monkeypatch.setattr(chat_module, "_require_registered_agent", lambda _base_url, name: selected)
     captured: dict[str, object] = {}
 
     def _fake_headless(
@@ -2326,6 +2378,7 @@ def test_run_prompt_url_target_runs_the_requested_agent(monkeypatch: pytest.Monk
         "base_url": "http://127.0.0.1:6767",
         "agent_name": "scribe",
         "prompt": "hi",
+        "registered_agent": selected,
     }
 
 
@@ -2333,10 +2386,12 @@ def test_run_chat_checks_agent_flag_against_the_server(monkeypatch: pytest.Monke
     """``--agent`` is validated before connecting, then starts the session as given."""
     checked: dict[str, str] = {}
 
-    def _fake_require(base_url: str, agent_name: str) -> str:
+    selected = chat_module._AgentChoice(id="ag_scribe", name="scribe", source="server")
+
+    def _fake_require(base_url: str, agent_name: str) -> chat_module._AgentChoice:
         checked["base_url"] = base_url
         checked["agent_name"] = agent_name
-        return agent_name
+        return selected
 
     captured: dict[str, object] = {}
 
@@ -2351,6 +2406,7 @@ def test_run_chat_checks_agent_flag_against_the_server(monkeypatch: pytest.Monke
     assert checked == {"base_url": "http://127.0.0.1:6767", "agent_name": "scribe"}
     assert captured["agent_name"] == "scribe"
     assert captured["initial_message"] == "hi"
+    assert captured["registered_agent"] is selected
 
 
 @pytest.mark.parametrize(
@@ -5445,6 +5501,49 @@ def _launch_turn(sessions: _LaunchSessions, monkeypatch: pytest.MonkeyPatch) -> 
 _STOP = {"type": "stop_session", "data": {}}
 
 
+@pytest.mark.parametrize("online_runner", [None, "runner_existing"])
+def test_one_shot_uses_selected_catalog_id_without_resolving_the_name_again(
+    monkeypatch: pytest.MonkeyPatch, online_runner: str | None
+) -> None:
+    """Both host launch and runner adoption use the selected identity and harness."""
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions(online_runner=online_runner)
+    harnesses: list[str | None] = []
+
+    async def _unexpected_lookup(_name: str) -> RegisteredAgent:
+        raise AssertionError("the catalog identity must not be resolved by name again")
+
+    async def _resolve_runner(*, harness: str | None, **_kwargs: object) -> str | None:
+        harnesses.append(harness)
+        return online_runner
+
+    async def _turn(**_kwargs: object) -> str:
+        return "pong"
+
+    monkeypatch.setattr(sessions, "resolve_agent", _unexpected_lookup)
+    monkeypatch.setattr(sessions, "resolve_online_runner", _resolve_runner)
+    monkeypatch.setattr(chat_module, "_run_bound_turn", _turn)
+    selected = RegisteredAgent(id="ag_selected", harness="openai-agents")
+
+    result = asyncio.run(
+        _query_sessions_once(
+            client=SimpleNamespace(sessions=sessions),  # type: ignore[arg-type]
+            agent_name="reviewer",
+            registered_agent=selected,
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+        )
+    )
+
+    assert result == "pong"
+    assert sessions.created["agent_id"] == "ag_selected"
+    assert harnesses == ["openai-agents"]
+    assert sessions.events == ([("conv_new", _STOP)] if online_runner is None else [])
+
+
 def test_one_shot_launches_on_this_host_and_stops_the_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5636,7 +5735,8 @@ def test_require_registered_agent_accepts_a_user_agent(monkeypatch: pytest.Monke
         user_pages=[_agents_page(["mine"])],
     )
 
-    assert chat_module._require_registered_agent("http://127.0.0.1:6799", "mine") == "mine"
+    selected = chat_module._require_registered_agent("http://127.0.0.1:6799", "mine")
+    assert selected.id == "ag_mine" and selected.source == "user"
 
 
 def test_pick_agent_offers_user_agents_on_a_fresh_server(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5653,16 +5753,44 @@ def test_pick_agent_offers_user_agents_on_a_fresh_server(monkeypatch: pytest.Mon
     assert "scribe" in str(excinfo.value) and "mine" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 422, 500])
+@pytest.mark.parametrize("status", [401, 403, 404, 422])
 def test_user_agent_listing_problems_fall_back_to_server_agents(
     status: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """User agents are optional: an old or failing ``scope=user`` listing isn't fatal."""
+    """An unsupported or forbidden user catalog does not hide usable server agents."""
     page = _agents_page(["scribe"])
     _serve_listings(monkeypatch, sessions=[], agent_pages=[page, page], user_status=status)
 
-    assert chat_module._require_registered_agent("http://127.0.0.1:6799", "scribe") == "scribe"
-    assert _pick_agent("http://127.0.0.1:6799", interactive=False) == "scribe"
+    assert (
+        chat_module._require_registered_agent("http://127.0.0.1:6799", "scribe").id == "ag_scribe"
+    )
+    assert _pick_agent("http://127.0.0.1:6799", interactive=False).id == "ag_scribe"
+
+
+@pytest.mark.parametrize("fault", ["http", "timeout", "malformed", "pagination"])
+def test_user_catalog_failure_cannot_silently_auto_select_a_server_agent(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """A failed user catalog is not evidence that only one agent is available."""
+    _serve_listings(monkeypatch, sessions=[], agent_pages=[_agents_page(["scribe"])])
+    original_get = chat_module.httpx.get
+
+    def _get(url: str, **kwargs: object) -> object:
+        params = kwargs.get("params")
+        if not isinstance(params, dict) or params.get("scope") != "user":
+            return original_get(url, **kwargs)
+        if fault == "timeout":
+            raise httpx.ReadTimeout("user catalog timed out")
+        if fault == "http":
+            response = httpx.Response(500, request=httpx.Request("GET", url))
+            return SimpleNamespace(raise_for_status=response.raise_for_status, json=dict)
+        body = {"data": {}} if fault == "malformed" else _agents_page(["mine"], has_more=True)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    with pytest.raises(click.ClickException, match="Agent discovery failed"):
+        _pick_agent("http://127.0.0.1:6799", quiet=True)
 
 
 _EVIL = "evil\x1b[2J\x1b]0;pwned\x07"
@@ -5757,10 +5885,10 @@ def test_one_shot_stops_the_launched_runner_when_session_ready_callback_fails(
     assert sessions.events == [("conv_new", _STOP)]
 
 
-def test_require_registered_agent_with_failing_user_listing_lists_server_agents(
+def test_require_registered_agent_with_failing_user_listing_reports_discovery_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A user agent can't be found when ``scope=user`` fails; the error still lists server ones."""
+    """A failed lookup must not misreport an installed user agent as unregistered."""
     _serve_listings(
         monkeypatch, sessions=[], agent_pages=[_agents_page(["scribe"])], user_status=500
     )
@@ -5768,7 +5896,8 @@ def test_require_registered_agent_with_failing_user_listing_lists_server_agents(
     with pytest.raises(click.ClickException) as excinfo:
         chat_module._require_registered_agent("http://127.0.0.1:6799", "mine")
 
-    assert "scribe" in str(excinfo.value)
+    assert "HTTP 500" in str(excinfo.value)
+    assert "not registered" not in str(excinfo.value)
 
 
 def test_user_agents_follow_the_listing_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5779,7 +5908,7 @@ def test_user_agents_follow_the_listing_cursor(monkeypatch: pytest.MonkeyPatch) 
         user_pages=[_agents_page(["a"], has_more=True, last_id="ag_a"), _agents_page(["b"])],
     )
 
-    assert chat_module._require_registered_agent("http://127.0.0.1:6799", "b") == "b"
+    assert chat_module._require_registered_agent("http://127.0.0.1:6799", "b").id == "ag_b"
 
 
 def test_no_registered_agents_message_mentions_agent_add() -> None:
