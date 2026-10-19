@@ -294,8 +294,8 @@ importers:
         specifier: ^0.16.47
         version: 0.16.47
       lucide-react:
-        specifier: ^1.12.0
-        version: 1.25.0(react@18.3.1)
+        specifier: ^1.55.0
+        version: 1.55.0(@types/react@19.2.17)(react@18.3.1)
       monaco-editor:
         specifier: ^0.55.1
         version: 0.55.1
@@ -7192,10 +7192,14 @@ packages:
     peerDependencies:
       react: ^18.2.0
 
-  lucide-react@1.25.0:
-    resolution: {integrity: sha512-/mdJTRbiwcLOQ1NZZK1amZF9rIZyvO18D6r9TngE6TG1NmqHgFuT4eE7Xrkm9UsXMbBJD1NlfwHVltCDWHrOTw==}
+  lucide-react@1.55.0:
+    resolution: {integrity: sha512-bSozQHiI3/8q7JvgoqVRGOYUi7fYT3siAZwmZsljjsOH2Husp/2ODdFf/leD+ZC/2yKfn7r8oh6yeoR3ITR5vA==}
     peerDependencies:
+      '@types/react': '*'
       react: ^18.2.0
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
 
   lz-string@1.5.0:
     resolution: {integrity: sha512-h5bgJWpxJNswbU7qCrV0tIKQCaS3blPDrqKWx+QxzuzL1zGUzij9XCWLrSLsJPu5t+eWA/ycetzYAO5IOMcWAQ==}
@@ -11503,7 +11507,7 @@ snapshots:
       immer: 11.1.15
       katex: 0.18.10
       leva: 0.10.1(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
-      lucide-react: 1.25.0(react@18.3.1)
+      lucide-react: 1.55.0(@types/react@19.2.17)(react@18.3.1)
       marked: 18.0.11
       motion: 12.42.2(@emotion/is-prop-valid@1.4.0)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       numeral: 2.0.6
@@ -17292,9 +17296,11 @@ snapshots:
     dependencies:
       react: 18.3.1
 
-  lucide-react@1.25.0(react@18.3.1):
+  lucide-react@1.55.0(@types/react@19.2.17)(react@18.3.1):
     dependencies:
       react: 18.3.1
+    optionalDependencies:
+      '@types/react': 19.2.17
 
   lz-string@1.5.0: {}
 
