@@ -67,7 +67,6 @@ async def resolve_remote_launch_host(
             canonicalize=lambda name: canonicalize_harness(name) or name,
         )
     except OmnigentError:
-        # Can't see the hosts: report the missing runner as before.
         logger.debug("could not list launch hosts", exc_info=True)
         return None
     local = identity.load_host_identity_if_present()

@@ -5139,6 +5139,23 @@ def test_run_agent_name_is_trimmed(monkeypatch: pytest.MonkeyPatch) -> None:
     assert run_chat.call_args.kwargs["agent_name"] == "scribe"
 
 
+def test_run_direct_server_fork_prompt_fails_before_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    discovery = Mock(side_effect=AssertionError("fork prompts must fail before discovery"))
+    monkeypatch.setattr("omnigent.chat._pick_agent", discovery)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--fork", "conv_x", "-p", "hi"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "--fork requires interactive REPL mode" in result.output
+    assert "--agent" not in result.output
+    discovery.assert_not_called()
+
+
 def test_run_agent_rejects_a_blank_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """``--agent ""`` must not silently fall back to agent discovery."""
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)

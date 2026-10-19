@@ -2664,10 +2664,20 @@ async def _query_sessions_once(
             # resolvable by name, so take the harness from the session.
             resumed = await client.sessions.get(resume_conversation_id)
             harness = resumed.harness if isinstance(resumed.harness, str) else None
-            if harness is None and resumed.agent_name:
-                # An older snapshot without a harness: ask the session's agent.
-                with contextlib.suppress(LookupError, ClientOmnigentError):
-                    harness = (await client.sessions.resolve_agent(resumed.agent_name)).harness
+            if harness is not None and not harness.strip():
+                harness = None
+            if harness is None:
+                lookup_error = _server_setup_error(
+                    f"Cannot determine the harness of session "
+                    f"{printable(resume_conversation_id)}; refusing to adopt an arbitrary runner."
+                )
+                try:
+                    if resumed.agent_name:
+                        harness = (await client.sessions.resolve_agent(resumed.agent_name)).harness
+                except (LookupError, ClientOmnigentError) as exc:
+                    raise lookup_error from exc
+                if not isinstance(harness, str) or not harness.strip():
+                    raise lookup_error
         else:
             agent = agent or await _resolve_remote_agent(client, agent_name)
             harness = agent.harness

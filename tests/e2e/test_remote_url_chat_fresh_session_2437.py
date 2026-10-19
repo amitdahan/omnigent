@@ -40,10 +40,10 @@ import pytest
 import yaml as _yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.host import isolated_host
 from tests._helpers.live_server import (
     isolated_local_server,
     isolated_process_env,
-    terminate_process,
 )
 from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
@@ -668,13 +668,11 @@ def test_run_one_shot_launches_a_runner_on_this_machines_host(
     )
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(mock_llm_server_url, [{"text": marker}] * 4, key=model)
-    home = tmp_path / "cli-home"
-    home.mkdir()
-
     with isolated_local_server(tmp_path / "server", extra_args=["--agent", str(yaml_path)]) as url:
-        host_log = (tmp_path / "host.log").open("w")
-        host = subprocess.Popen(
-            [
+        with isolated_host(
+            tmp_path / "host",
+            url,
+            command=[
                 sys.executable,
                 "-c",
                 "from omnigent.cli import main\n\nmain()\n",
@@ -684,32 +682,32 @@ def test_run_one_shot_launches_a_runner_on_this_machines_host(
                 "--no-open",
                 "--non-interactive",
             ],
-            env=isolated_process_env(home, {"TERM": "dumb", "OPENAI_API_KEY": "mock-key"}, None),
-            stdin=subprocess.DEVNULL,
-            stdout=host_log,
-            stderr=subprocess.STDOUT,
-        )
-        try:
+            env={"TERM": "dumb", "OPENAI_API_KEY": "mock-key"},
+        ) as host:
             with httpx.Client(base_url=url, timeout=10.0) as client:
-
-                def _host_online() -> bool:
-                    hosts = client.get("/v1/hosts").json().get("hosts", [])
-                    return any(h.get("status") == "online" for h in hosts)
-
-                _wait_until(_host_online, timeout=90.0, what="the host to connect")
+                host.wait_online(client, timeout=90.0)
                 assert client.get("/v1/runners").json()["data"] == []
 
                 proc = _run_cli(
-                    home, "run", "--server", url, "--agent", agent_name, "-p", "hi", timeout=180.0
+                    host.home,
+                    "run",
+                    "--server",
+                    url,
+                    "--agent",
+                    agent_name,
+                    "-p",
+                    "hi",
+                    timeout=180.0,
                 )
                 output = proc.stdout + proc.stderr
-                assert proc.returncode == 0, output + (tmp_path / "host.log").read_text()
+                assert proc.returncode == 0, output + host.log_path.read_text()
                 assert marker in proc.stdout, output
 
                 sessions = client.get(
                     "/v1/sessions", params={"visibility": "all", "limit": 10}
                 ).json()["data"]
-                assert len(sessions) == 1 and sessions[0].get("host_id"), sessions
+                assert len(sessions) == 1, sessions
+                assert sessions[0].get("host_id") == host.host_id, sessions
                 # The one-shot stops the runner it caused the host to launch.
                 _wait_until(
                     lambda: (
@@ -718,6 +716,3 @@ def test_run_one_shot_launches_a_runner_on_this_machines_host(
                     timeout=60.0,
                     what="the launched runner to stop",
                 )
-        finally:
-            terminate_process(host)
-            host_log.close()

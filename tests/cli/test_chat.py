@@ -12,7 +12,7 @@ import click
 import httpx
 import pytest
 from omnigent_client import OmnigentError as ClientOmnigentError
-from omnigent_client import PaginatedList, QueryResult, RegisteredAgent
+from omnigent_client import PaginatedList, QueryResult, RegisteredAgent, SessionsNamespace
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
@@ -5685,21 +5685,89 @@ def test_resume_one_shot_with_odd_harness_uses_the_sessions_agent() -> None:
     assert seen == {"resolved": "scribe", "harness": "claude-sdk"}
 
 
-def test_resume_one_shot_harness_lookup_server_error_is_not_fatal() -> None:
-    """If the agent lookup for a harness-less snapshot fails, carry on without a harness."""
+@pytest.mark.parametrize(
+    "failure", [LookupError("missing"), ClientOmnigentError("listing failed")]
+)
+def test_resume_one_shot_harness_lookup_failure_refuses_runner_adoption(
+    failure: Exception,
+) -> None:
+    """A failed harness lookup must never select an arbitrary online runner."""
     seen: dict[str, object] = {}
     snapshot = SimpleNamespace(id="conv_x", harness=None, agent_name="scribe")
     client = _resume_client(snapshot, seen)
 
     async def _listing_fails(_name: str) -> object:
-        raise ClientOmnigentError("listing failed")
+        raise failure
 
     client.sessions.resolve_agent = _listing_fails
 
-    with pytest.raises(_StopAtBind):
+    with pytest.raises(click.ClickException, match="Cannot determine the harness") as excinfo:
         _resume_once(client, agent_name="scribe")
 
-    assert seen == {"harness": None}
+    assert excinfo.value.__cause__ is failure
+    assert seen == {}
+
+
+@pytest.mark.parametrize("agent_name", [None, "scribe"])
+@pytest.mark.parametrize("harness", [None, "", " ", ["claude-sdk"]])
+def test_resume_one_shot_without_a_usable_harness_refuses_runner_adoption(
+    agent_name: str | None,
+    harness: object,
+) -> None:
+    seen: dict[str, object] = {}
+    snapshot = SimpleNamespace(id="conv_x", harness=harness, agent_name=agent_name)
+    client = _resume_client(snapshot, seen)
+
+    async def _no_harness(_name: str) -> RegisteredAgent:
+        return RegisteredAgent(id="ag_scribe", harness=harness)  # type: ignore[arg-type]
+
+    client.sessions.resolve_agent = _no_harness
+
+    with pytest.raises(click.ClickException, match="Cannot determine the harness"):
+        _resume_once(client, agent_name="scribe")
+
+    assert seen == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listing_status", [200, 500])
+async def test_resume_old_snapshot_fails_before_runner_requests(listing_status: int) -> None:
+    """Decode an old server snapshot and refuse an unavailable harness at the HTTP boundary."""
+    requests: list[str] = []
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/v1/sessions/conv_x":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_x",
+                    "agent_id": "ag_uploaded",
+                    "agent_name": "uploaded",
+                    "status": "idle",
+                    "created_at": 0,
+                },
+            )
+        assert request.url.path == "/v1/agents", request.url
+        return httpx.Response(listing_status, json={"data": [], "has_more": False})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_respond)) as http:
+        client = SimpleNamespace(sessions=SessionsNamespace(http, "http://localhost:6767"))
+        with pytest.raises(click.ClickException, match="Cannot determine the harness") as excinfo:
+            await _query_sessions_once(
+                client=client,  # type: ignore[arg-type]
+                agent_name="uploaded",
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+                resume_conversation_id="conv_x",
+            )
+
+    assert suppresses_recovery_hint(excinfo.value)
+    assert requests[0] == "/v1/sessions/conv_x"
+    assert requests[1:] and set(requests[1:]) == {"/v1/agents"}
 
 
 def test_one_shot_unknown_agent_is_a_clean_cli_error() -> None:
@@ -5751,6 +5819,31 @@ def test_pick_agent_offers_user_agents_on_a_fresh_server(monkeypatch: pytest.Mon
         _pick_agent("http://127.0.0.1:6799", interactive=False)
 
     assert "scribe" in str(excinfo.value) and "mine" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("same_registration", [False, True])
+def test_pick_agent_prefers_server_agent_over_same_named_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    same_registration: bool,
+) -> None:
+    server_agent = {"id": "ag_server", "name": "scribe", "harness": "claude-sdk"}
+    user_agent = (
+        server_agent
+        if same_registration
+        else {"id": "ag_user", "name": "scribe", "harness": "openai-agents"}
+    )
+    _serve_listings(
+        monkeypatch,
+        sessions=[],
+        agent_pages=[{"data": [server_agent]}],
+        user_pages=[{"data": [user_agent]}],
+    )
+
+    selected = _pick_agent("http://127.0.0.1:6799", interactive=False)
+
+    assert selected.id == "ag_server"
+    assert selected.harness == "claude-sdk"
+    assert selected.source == "server"
 
 
 @pytest.mark.parametrize("status", [401, 403, 404, 422])
