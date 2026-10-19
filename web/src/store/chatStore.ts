@@ -68,6 +68,7 @@ import {
   getSessionSlim,
   getSessionUsage,
   fetchSessionItemsPage,
+  HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
   openSessionStream,
@@ -109,6 +110,7 @@ import {
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
@@ -134,7 +136,12 @@ import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
-import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
+import {
+  getCurrentAuthorId,
+  getCurrentUserId,
+  resolveSessionHost,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
@@ -603,6 +610,8 @@ export interface QueuedMessage {
   stableId?: string;
   /** A failed send stays queued until the user explicitly retries or edits it. */
   requiresRetry?: boolean;
+  /** The session's host was offline; held until it reconnects, then sent. */
+  waitingForHost?: boolean;
 }
 
 /**
@@ -1172,6 +1181,8 @@ export interface ChatActions {
    * turn) when the session next goes idle — see the `session_status` handler.
    */
   enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  /** Let a conversation's messages held for an offline host flush again. */
+  releaseHostHeldMessages: (conversationId: string) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -2084,6 +2095,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }));
   },
 
+  releaseHostHeldMessages: (conversationId) => {
+    setActive((s) => {
+      if (!s.queuedMessages.some((m) => m.conversationId === conversationId && m.waitingForHost)) {
+        return {};
+      }
+      return {
+        queuedMessages: s.queuedMessages.map((m) =>
+          m.conversationId === conversationId && m.waitingForHost
+            ? { ...m, waitingForHost: false }
+            : m,
+        ),
+      };
+    });
+  },
+
   reorderQueuedMessage: (queueId, beforeQueueId) => {
     setActive((s) => {
       const moved = s.queuedMessages.find((m) => m.queueId === queueId);
@@ -2208,7 +2234,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry) return;
+    if (head === undefined || head.requiresRetry || head.waitingForHost) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -2271,7 +2297,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined || head.requiresRetry) continue;
+      if (head === undefined || head.requiresRetry || head.waitingForHost) continue;
       const compactAgentId = head.agentId ?? local?.boundAgentId;
       if (head.command === "compact" && !compactAgentId) continue;
 
@@ -2572,6 +2598,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // Only the composer on screen takes back a send cut off by a reload (see
+    // `unsentSendToRestore`); a side chat posts to its child beside the parent.
+    const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
 
     // Take our place in THIS conversation's send chain: wait for its prior
     // send's network work, then hand off to the next via `releaseSend` in the
@@ -2599,6 +2628,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
+      // Until this send settles, the server may hold the message without persisting
+      // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
+      // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
+      // tells the single-user `local` viewer apart from one not yet resolved.
+      const senderId = getCurrentUserId();
+      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
+        rememberUnsentSend(sessionId, {
+          stableId,
+          text,
+          authorId: senderId,
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+        });
+      }
       if (initialDraft && !(await waitForInitialDispatch(sessionId, tempId))) return;
 
       if (compacts) {
@@ -2649,14 +2691,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
-          stable_id: stableId,
+      const postResult = await postEvent(
+        sessionId,
+        {
+          type: "message",
+          data: {
+            role: "user",
+            content: serverContent,
+            stable_id: stableId,
+          },
         },
-      });
+        { holdWhenHostOffline: true },
+      );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -2727,8 +2773,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // suppresses the default surfacing below — no restored draft, no error
       // block in the parent transcript. The bubble rollback + status settle still
       // run so the parent isn't left mid-send.
-      const callerHandlesError = opts?.onError !== undefined;
-      opts?.onError?.(message);
+      // The host is offline and the server recorded nothing: queue the message
+      // ahead of this conversation's others and send it once the host is back.
+      const holdTarget = postedSessionId ?? submitConversationId;
+      const heldForHost =
+        err instanceof ApiError && err.code === HOST_OFFLINE_CODE && holdTarget !== null;
+      if (heldForHost) {
+        holdSendForHost(holdTarget, message, {
+          text,
+          stableId,
+          ...(agentId ? { agentId } : {}),
+          ...(files && files.length > 0 ? { files } : {}),
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+        });
+      }
+      const callerHandlesError = heldForHost || opts?.onError !== undefined;
+      if (!heldForHost) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -2836,6 +2896,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
+      if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
@@ -3604,6 +3665,39 @@ function rejectBusyCompact(conversationId: string | null): boolean {
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;
+}
+
+/**
+ * Queue a send the server refused because the session's host is offline. It
+ * waits ahead of the conversation's other queued messages until
+ * `releaseHostHeldMessages` runs, then flushes like any queued message.
+ */
+function holdSendForHost(
+  conversationId: string,
+  notice: string,
+  message: Omit<QueuedMessage, "queueId" | "conversationId">,
+): void {
+  queueSeq += 1;
+  const held: QueuedMessage = {
+    ...message,
+    queueId: `q_${queueSeq}`,
+    conversationId,
+    waitingForHost: true,
+  };
+  setActive((s) => {
+    const at = s.queuedMessages.findIndex(
+      (m) => m.conversationId === conversationId && !m.waitingForHost,
+    );
+    const index = at === -1 ? s.queuedMessages.length : at;
+    return {
+      queuedMessages: [...s.queuedMessages.slice(0, index), held, ...s.queuedMessages.slice(index)],
+    };
+  });
+  setterFor(conversationId)((s) => {
+    const last = s.blocks[s.blocks.length - 1];
+    if (last?.type === "error" && last.code === HOST_OFFLINE_CODE) return {};
+    return { blocks: [...s.blocks, makeClientErrorBlock(notice, HOST_OFFLINE_CODE)] };
+  });
 }
 
 function queuedSendOptions(
@@ -4540,6 +4634,7 @@ async function bindStream(
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
+    const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
@@ -4670,6 +4765,9 @@ async function bindStream(
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
+        ...(unsentDraft !== null && state.failedSendDraft === null
+          ? { failedSendDraft: unsentDraft }
+          : {}),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
@@ -6960,6 +7058,73 @@ async function sendVerdictFromServer(
   } catch {
     return null;
   }
+}
+
+/**
+ * The send a previous page of this tab left unanswered, as a failed-send draft.
+ *
+ * `send` records each message's text before its POST and drops it once the
+ * POST settles. A record found on a cold bind therefore comes from a page that
+ * reloaded or closed mid-send, e.g. while the server held the POST for a
+ * sandbox wake, which persists nothing until the wake ends. Only the sender
+ * gets the text back, and only if the snapshot holds no item under its stable
+ * id. Matching text is no proof: `pending_inputs` entries and native mirrors
+ * carry no stable id, and another message can say the same thing.
+ *
+ * @param conversationId - The session being bound.
+ * @param items - The snapshot's committed items.
+ * @returns The draft to restore, or `null`.
+ */
+function unsentSendToRestore(
+  conversationId: string,
+  items: readonly { id: string }[],
+): ConversationState["failedSendDraft"] {
+  const unsent = peekUnsentSend(conversationId);
+  // A send still open in this tab settles on its own.
+  if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
+  const viewerId = getCurrentUserId();
+  // The viewer can't be checked before identity resolves; try again once it does.
+  if (viewerId === null) {
+    restoreUnsentSendOnceIdentified(conversationId, items);
+    return null;
+  }
+  forgetUnsentSend(conversationId, unsent.stableId);
+  // Another account has signed in to this tab since.
+  if (unsent.authorId !== viewerId) return null;
+  if (items.some((item) => item.id === unsent.stableId)) return null;
+  return {
+    conversationId,
+    text: unsent.text,
+    files: [],
+    stableId: unsent.stableId,
+    ...(unsent.replyDraft ? { replyDraft: unsent.replyDraft } : {}),
+    serverRefused: false,
+  };
+}
+
+/**
+ * Finish a restore `unsentSendToRestore` put off until `/v1/me` names the viewer.
+ * The bind has already painted, so the draft goes straight onto the session's
+ * entry. Subscribing keeps a failed probe retrying.
+ *
+ * @param conversationId - The session whose bind put the restore off.
+ * @param items - That bind's snapshot items.
+ */
+function restoreUnsentSendOnceIdentified(
+  conversationId: string,
+  items: readonly { id: string }[],
+): void {
+  const unsubscribe = subscribeIdentity(() => {
+    if (getCurrentUserId() === null) return;
+    unsubscribe();
+    // An evicted session keeps the record for its next bind.
+    if (isConversationDisposed(conversationId)) return;
+    const draft = unsentSendToRestore(conversationId, items);
+    if (draft === null) return;
+    setterFor(conversationId)((state) =>
+      state.failedSendDraft === null ? { failedSendDraft: draft } : {},
+    );
+  });
 }
 
 /**

@@ -41,12 +41,15 @@ starts at `direct-link` and performs these actions in order:
 
 1. Read the heading, ordered list, table, and original code block.
 2. Create another Python code block and type two lines; verify the caret stays
-   inside it and autosave submits the changed Markdown.
-3. Reload and verify the edit is returned by the mock filesystem.
+   inside it. Change the original block's language with the pointer and the new
+   block's language with the keyboard, then verify autosave submits the changes.
+3. Reload and verify the edit and fence language are returned by the mock
+   filesystem.
 4. Find the edited text and verify exactly one match.
 5. Switch through Source, Preview, and Edit, retaining the changed text.
 6. Resize from desktop to phone and back, retaining the saved content.
-7. Select text and start an unsubmitted comment; end with its text focused.
+7. Double-click "Review" in the first paragraph, verify the comment anchors to
+   that word, and start an unsubmitted comment; end with its text focused.
 
 The fixture is
 [markdown_editor_journey.md](../tests/browser_ui/files/markdown_editor_journey.md).
@@ -100,9 +103,14 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
 - `files`, `read`, and `modes`:
   `tests/e2e_ui/files/test_markdown_rich_rendering.py::test_markdown_renders_rich_constructs_and_source_toggle`
   opens from Files and checks rich constructs, reflow, copying, and Source.
+- `files`, oversized read-only content:
+  `tests/e2e_ui/files/test_right_panel.py::test_file_viewer_download_saves_the_complete_file`
+  includes a single-line Markdown file beyond the server read cap. Its loaded
+  prefix must render read-only, and downloading must preserve the entire file.
 - `direct-link`, `edit-save`:
   `tests/e2e_ui/files/test_file_autosave.py::test_markdown_edit_autosaves`
-  confirms the edit through a fresh filesystem API read from the real server.
+  confirms the edit, undo, and redo through fresh filesystem API reads from
+  the real server, then reloads the saved edit.
 - `files`, `review`:
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_markdown_rich_text_editor_add_comment`
   submits a comment and checks its stored anchor. The heading variant is
@@ -132,6 +140,16 @@ instead of treating one comparison clip as complete feature verification.
 
 - File editing uses TipTap. Chat Markdown, read-only Preview, and Source use
   different rendering paths; speeding up one does not validate the others.
+- Task-list tokenization and table-start detection bound the source passed to
+  TipTap 3.31.4. `web/src/shell/tiptapBoundedTokenizers.test.ts` checks upstream
+  token compatibility and line-splitting volume using the CUJ fixture. Remove
+  these bounds when upstream avoids the repeated whole-remainder scans.
+- Load measurements do not establish typing latency. Dirty detection compares
+  immutable editor documents; autosave still serializes the whole document.
+  Changes that serialize identically become clean when autosave checks them.
+- Setext-heading detection uses a line scanner with marked 17 interruption
+  rules. Compatibility tests compare it with upstream; remove the workaround
+  when upstream handles long lines without exhausting the regex stack.
 - Browser-contract saves update an in-memory mock filesystem. A successful
   reload there does not prove server/runner persistence or external-file edits.
 - Desktop and mobile can have hidden viewer instances on older revisions.
