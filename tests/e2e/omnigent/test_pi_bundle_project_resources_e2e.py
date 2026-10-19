@@ -27,6 +27,7 @@ import yaml
 
 from tests.e2e._harness_probes import bwrap_namespace_unavailable_reason, cli_unavailable_reason
 from tests.e2e.conftest import get_mock_requests
+from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
 from tests.e2e.omnigent.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _PI_UNAVAILABLE = cli_unavailable_reason("pi")
@@ -106,25 +107,7 @@ def _run_bundle_from_sibling_cwd(
     set_fallback_mock_llm(mock_llm_server_url, model, "ok")
 
     config_home = tmp_path / "config"
-    config_home.mkdir()
-    (config_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "auth": {"type": "api_key"},
-                "providers": {
-                    "mock-oai": {
-                        "kind": "key",
-                        "default": True,
-                        "openai": {
-                            "base_url": f"{mock_llm_server_url}/v1",
-                            "api_key": "mock-key",
-                            "models": {"default": model},
-                        },
-                    }
-                },
-            }
-        )
-    )
+    write_pi_gateway_config(config_home, mock_url=mock_llm_server_url, model=model)
 
     # Run cwd is a sibling of the bundle, so Pi's cwd-relative discovery
     # cannot reach the bundle resources on its own.
