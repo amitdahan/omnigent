@@ -191,25 +191,13 @@ _ALLOWED_SOCKET_FAMILIES = (
 # return EPERM). On these backends the bwrap wrap binds the host
 # ``/proc`` instead of emitting ``--proc /proc``.
 #
-# Why an explicit allow-list rather than a "fresh-proc mount failed, retry
-# with a bind" fallback: binding the existing ``/proc`` is a security
-# DOWNGRADE. It exposes the outer process list plus the world-readable
-# per-process files (``cmdline`` / ``comm`` / ``stat`` / ``status``) to the
-# sandboxed helper. It does NOT expose the ptrace-gated files (``environ``
-# / ``mem`` / ``maps`` / ``fd``): the retained user namespace keeps those
-# blocked even for same-uid targets and even as namespaced root, and
-# ``--unshare-pid`` still contains signalling. That leak is acceptable on a
-# single-tenant dev microVM (Lakebox) but not on an arbitrary host, so the
-# downgrade is only taken for vetted backends. Kubernetes launchers may
-# declare this only for single-tenant pods with isolated PID namespaces
-# (no ``hostPID`` or ``shareProcessNamespace``).
+# Binding outer ``/proc`` exposes process metadata, so only vetted single-tenant
+# sandboxes may opt in. Kubernetes requires isolated PID namespaces: no
+# ``hostPID`` or ``shareProcessNamespace``.
 _PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"kubernetes", "lakebox"})
 
-# Env var an outer launcher may set to name the host's outer sandbox
-# backend (e.g. ``lakebox``). Authoritative when present; otherwise the
-# backend is autodetected (see ``_detect_host_sandbox_backend``). The
-# backend resolves this into ``SandboxPolicy.bind_host_proc`` before
-# launcher environment pruning.
+# Launcher-declared outer backend; overrides autodetection. ``resolve()`` reads
+# it before environment pruning to set ``SandboxPolicy.bind_host_proc``.
 _HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 
 # Marker directory the Databricks Lakebox runtime seeds inside every
@@ -254,6 +242,11 @@ def _should_bind_host_proc() -> bool:
     :data:`_PROC_BIND_HOST_BACKENDS`. On every other host
     the fresh-proc mount is kept, so ordinary hosts — and their fail-closed
     behaviour when a fresh procfs mount is denied — are unchanged.
+
+    Binding outer ``/proc`` exposes its world-readable process metadata.
+    The user namespace still blocks ptrace-gated files, and ``--unshare-pid``
+    contains signalling, but callers must still provide an isolated,
+    single-tenant outer PID namespace.
 
     :returns: ``True`` to emit ``--bind /proc /proc``; ``False`` to emit
         ``--proc /proc``.
@@ -456,16 +449,8 @@ class BwrapSandboxBackend(SandboxBackend):
         for path in _DEFAULT_ETC_DIRS:
             bwrap_args += ["--ro-bind-try", path, path]
 
-        # /proc, /dev (filtered by bwrap to a safe minimal device set),
-        # and a private /tmp so the agent's writes there don't pollute
-        # the host.
-        #
-        # ``--proc`` mounts a FRESH procfs tied to the new PID namespace so
-        # the helper sees only its own processes. Some nested outer
-        # sandboxes forbid that mount under ``--unshare-pid``
-        # (masked ``/proc`` overmounts -> ``mount proc: EPERM``), so there
-        # we bind the outer ``/proc`` instead. The backend resolves this
-        # choice before launcher environment pruning.
+        # Fresh procfs by default; bind outer /proc where nested sandboxes deny
+        # the mount. Bwrap supplies a minimal /dev and private /tmp.
         if policy.bind_host_proc:
             bwrap_args += ["--bind", "/proc", "/proc"]
         else:

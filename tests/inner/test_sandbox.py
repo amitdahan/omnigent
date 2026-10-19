@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 
@@ -506,10 +507,10 @@ def test_run_launcher_keeps_resolved_proc_bind_after_env_pruning(
     monkeypatch.setattr("omnigent.inner.sandbox.create_private_tmpdir", lambda: scratch)
     monkeypatch.setattr(os, "execvp", _capture_exec)
 
-    with pytest.raises(SystemExit):
-        run_launcher(encoded, sys.executable, ["-c", "pass"], cwd=str(tmp_path))
-
-    assert "OMNIGENT_HOST_SANDBOX_BACKEND" not in os.environ
+    with mock.patch.dict(os.environ):
+        with pytest.raises(SystemExit):
+            run_launcher(encoded, sys.executable, ["-c", "pass"], cwd=str(tmp_path))
+        assert "OMNIGENT_HOST_SANDBOX_BACKEND" not in os.environ
     assert any(
         captured[index : index + 3] == ["--bind", "/proc", "/proc"]
         for index in range(len(captured) - 2)
