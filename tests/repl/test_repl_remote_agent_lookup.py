@@ -99,6 +99,8 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
         "load_host_identity_if_present",
         lambda: SimpleNamespace(host_id="host_local"),
     )
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_unrelated")
     created: list[dict[str, object]] = []
     requests: list[str] = []
     snapshot = {
@@ -155,9 +157,13 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             return httpx.Response(200, json={"hosts": hosts})
         if path == "/v1/sessions" and request.method == "POST":
             created.append(json.loads(request.content))
+            if created[-1].get("host_id"):
+                assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_local"
             return httpx.Response(201, json=snapshot)
         if path == "/v1/sessions/conv_remote" and request.method == "GET":
-            assert scenario == "resume"
+            if scenario != "resume":
+                assert created[-1]["host_id"] == "host_local"
+                assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_local"
             return httpx.Response(200, json=snapshot)
         if path == "/v1/sessions/conv_remote" and request.method == "PATCH":
             assert scenario == "online-runner"
@@ -197,5 +203,7 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
                 if scenario in {"local-host", "mismatched-runner"}:
                     expected_body["host_id"] = "host_local"
                 assert created == [expected_body]
+                if "host_id" in expected_body:
+                    await adapter._client.sessions.get("conv_remote")
         finally:
             await adapter.aclose()

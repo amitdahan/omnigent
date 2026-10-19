@@ -71,3 +71,22 @@ def test_auth_no_key_off_workspace() -> None:
     set_session_host("conv_1", "host_abc")
     auth = _DatabricksTokenAuth(server_url="http://127.0.0.1:6767", session_id="conv_1")
     assert _slice_key(auth, "http://127.0.0.1:6767/v1/sessions/conv_1/events") is None
+
+
+def test_repointed_session_host_overrides_the_launch_header() -> None:
+    """A client's pre-create host pin must not override a later session binding."""
+    mount = "https://acme.databricks.com/api/2.0/omnigent"
+    set_session_host("conv_old", "host_old")
+    set_session_host("conv_new", "host_new")
+    auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_old")
+    auth.pin_session("conv_new")
+    flow = auth.auth_flow(
+        httpx.Request(
+            "GET",
+            f"{mount}/v1/sessions/conv_new/events",
+            headers={OMNIGENT_SLICE_KEY_HEADER: "host_old"},
+        )
+    )
+    request = next(flow)
+    flow.close()
+    assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == "host_new"

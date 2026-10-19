@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -1984,14 +1985,38 @@ def test_pick_agent_rejects_a_listing_without_a_data_list(
         _pick_agent("http://127.0.0.1:6767")
 
 
-def test_pick_agent_skips_malformed_listing_rows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Rows that are not objects or lack a string name are ignored, as the SDK resolver does."""
-    rows = [None, {"id": "ag_x"}, {"name": 7}, {"name": "no-id"}, {"name": "scribe", "id": "ag_s"}]
+@pytest.mark.parametrize(
+    "invalid_row",
+    [
+        None,
+        "bad",
+        {},
+        {"id": "ag_x"},
+        {"name": "other"},
+        {"id": "ag_x", "name": 7},
+        {"id": 7, "name": "other"},
+        {"id": "", "name": "other"},
+        {"id": "ag_x", "name": ""},
+        {"id": " ", "name": "other"},
+        {"id": "ag_x", "name": " "},
+    ],
+)
+@pytest.mark.parametrize("scope", [None, "user"])
+def test_pick_agent_rejects_malformed_listing_rows(
+    monkeypatch: pytest.MonkeyPatch, invalid_row: object, scope: str | None
+) -> None:
+    """A valid survivor must not auto-select when discovery is incomplete."""
+    rows = [{"name": "scribe", "id": "ag_s"}, invalid_row]
+    page = {"data": rows, "has_more": False, "last_id": None}
     _serve_listings(
-        monkeypatch, sessions=[], agent_pages=[{"data": rows, "has_more": False, "last_id": None}]
+        monkeypatch,
+        sessions=[],
+        agent_pages=[page] if scope is None else [_agents_page([])],
+        user_pages=[page] if scope == "user" else None,
     )
 
-    assert _pick_agent("http://127.0.0.1:6767", quiet=True).id == "ag_s"
+    with pytest.raises(click.ClickException, match="malformed agent"):
+        _pick_agent("http://127.0.0.1:6767", quiet=True)
 
 
 def test_pick_agent_includes_unused_registered_agents(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5506,6 +5531,8 @@ class _LaunchSessions:
         default: list[object] = [LaunchHost("host_local", "me.local")]
         self._hosts: list[object] = hosts if hosts is not None else default
         self._stop_error = stop_error
+        self._base = "http://srv"
+        self._http = SimpleNamespace(headers={})
         self.events: list[tuple[str, dict[str, object]]] = []
         self.created: dict[str, object] = {}
         self.bound: list[str] = []
@@ -5615,6 +5642,93 @@ def test_one_shot_launches_on_this_host_and_stops_the_runner(
     assert sessions.created["host_id"] == "host_local"
     assert sessions.bound == []  # the server binds the runner it launched
     assert sessions.events == [("conv_new", _STOP)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", [None, "test-token"])
+@pytest.mark.parametrize("sharded", [False, True])
+async def test_one_shot_host_launch_routes_actual_http_requests(
+    monkeypatch: pytest.MonkeyPatch, token: str | None, sharded: bool
+) -> None:
+    """Creation, session reads and cleanup use the selected host, even without token auth."""
+    _local_host(monkeypatch, "host_local")
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1" if sharded else "0")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_unrelated")
+    monkeypatch.setattr(chat_module, "_read_databrickscfg", lambda *_args: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda *_args: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda *_args: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda *_args: None)
+    if token:
+        monkeypatch.setenv(chat_module._REMOTE_AUTH_TOKEN_ENV, token)
+    else:
+        monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    base_url = "http://srv"
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/runners":
+            return httpx.Response(200, json={"data": []})
+        if path == "/v1/hosts":
+            return httpx.Response(
+                200,
+                json={"hosts": [{"host_id": "host_local", "name": "me", "status": "online"}]},
+            )
+        assert request.headers.get("X-Databricks-Omnigent-Slice-Key") == (
+            "host_local" if sharded else None
+        )
+        assert request.headers.get("Authorization") == (f"Bearer {token}" if token else None)
+        if path == "/v1/sessions":
+            assert json.loads(request.content)["host_id"] == "host_local"
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_routed",
+                    "agent_id": "ag_s",
+                    "host_id": "host_local",
+                    "status": "idle",
+                    "created_at": 0,
+                },
+            )
+        if path == "/v1/sessions/conv_routed/events":
+            assert json.loads(request.content) == _STOP
+            return httpx.Response(200, json={"queued": False})
+        assert path == "/v1/sessions/conv_routed"
+        return httpx.Response(
+            200,
+            json={"id": "conv_routed", "agent_id": "ag_s", "status": "idle", "created_at": 0},
+        )
+
+    async def turn(*, client: object, bound: object, **_kwargs: object) -> str:
+        await sessions.get("conv_routed")
+        return "pong"
+
+    monkeypatch.setattr(chat_module, "_run_bound_turn", turn)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers=chat_module._server_headers(),
+        auth=chat_module._server_auth(server_url=base_url, session_id=None),
+    ) as http:
+        sessions = SessionsNamespace(http, base_url)
+        result = await _query_sessions_once(
+            client=SimpleNamespace(sessions=sessions),  # type: ignore[arg-type]
+            agent_name="scribe",
+            registered_agent=RegisteredAgent(id="ag_s", harness=None),
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+        )
+    assert result == "pong"
+    assert [f"{request.method} {request.url.path}" for request in requests] == [
+        "GET /v1/runners",
+        "GET /v1/hosts",
+        "POST /v1/sessions",
+        "GET /v1/sessions/conv_routed",
+        "POST /v1/sessions/conv_routed/events",
+    ]
 
 
 def test_one_shot_stop_failure_keeps_the_reply(monkeypatch: pytest.MonkeyPatch) -> None:

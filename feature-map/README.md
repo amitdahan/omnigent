@@ -93,6 +93,10 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
   review, deletion, and capability gating.
 
+- [Remote agent launch](./remote-agent-launch.md) covers registered-agent
+  discovery and selection through `omnigent run --server`, interactive and
+  one-shot host launch, existing-session boundaries, and failure diagnostics.
+
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, and slash commands.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
@@ -160,7 +164,8 @@ map an area, remove it here in the same change.
 - Setup and diagnostics: `omnigent setup`, `omnigent config`, `omnigent doctor`,
   `omnigent diagnose`, `omnigent debug`, `omnigent usage`
 - Install lifecycle: `omnigent upgrade`, `omnigent update`, `omnigent uninstall`
-- Running agents and servers: `omnigent run`, `omnigent start`, `omnigent stop`,
+- Other running-agent and server workflows: `omnigent run` (local/native modes),
+  `omnigent start`, `omnigent stop`,
   `omnigent server`, `omnigent attach`, `omnigent resume`, `omnigent session`,
   `omnigent import`
 - Bundled agents and the Copilot harness: `omnigent polly`, `omnigent debby`,

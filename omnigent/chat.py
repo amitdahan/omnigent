@@ -900,11 +900,17 @@ class _DatabricksTokenAuth(httpx.Auth):
         # from the session→host map. An unsharded server has no sharding layer,
         # so no key.
         if self._server_url:
-            from omnigent.cli_auth import databricks_request_headers
+            from omnigent.cli_auth import (
+                OMNIGENT_SLICE_KEY_HEADER,
+                databricks_request_headers,
+            )
 
             session_host = get_session_host(self._session_id) if self._session_id else None
             request.headers.update(
-                databricks_request_headers(self._server_url, host_id=session_host)
+                databricks_request_headers(
+                    self._server_url,
+                    host_id=session_host or request.headers.get(OMNIGENT_SLICE_KEY_HEADER),
+                )
             )
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
@@ -1529,11 +1535,13 @@ def _discovery_get(
 def _listing_items(
     body: dict[str, Any], base_url: str, path: str, *, what: str = "Agent discovery"
 ) -> list[dict[str, Any]]:
-    """Return the object rows of a listing body, rejecting a ``data`` that is not a list."""
+    """Return listing rows without silently discarding malformed entries."""
     data = body.get("data")
     if not isinstance(data, list):
         raise _discovery_error(base_url, path, "returned an unexpected body shape", what=what)
-    return [item for item in data if isinstance(item, dict)]
+    if any(not isinstance(item, dict) for item in data):
+        raise _discovery_error(base_url, path, "returned a malformed agent row", what=what)
+    return data
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1587,12 +1595,17 @@ def _server_agents(
             agent_id = item.get("id")
             harness = item.get("harness")
             if (
-                isinstance(name, str)
-                and name
-                and name not in seen
-                and isinstance(agent_id, str)
-                and agent_id
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(agent_id, str)
+                or not agent_id.strip()
             ):
+                raise _discovery_error(
+                    base_url,
+                    "/v1/agents",
+                    "returned a malformed agent row (expected non-empty string id and name)",
+                )
+            if name not in seen:
                 seen.add(name)
                 agents.append(
                     _AgentChoice(
@@ -2662,7 +2675,11 @@ async def _query_sessions_once(
         runner to adopt and no connected host to launch one on.
     :raises RuntimeError: If no runner id was supplied.
     """
-    from omnigent.remote_launch import LaunchHostError, resolve_remote_launch_host
+    from omnigent.remote_launch import (
+        LaunchHostError,
+        pin_remote_launch_host,
+        resolve_remote_launch_host,
+    )
 
     # Remote target: no local bundle means no local runner either, so
     # adopt one the server already has online, or have a host launch one,
@@ -2713,6 +2730,7 @@ async def _query_sessions_once(
             )
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
     if launch_host_id is not None and agent is not None:
+        pin_remote_launch_host(client.sessions, launch_host_id)
         # The server launches and binds the host's runner itself.
         bound = await client.sessions.create_from_agent_id(
             agent.id,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from omnigent.cli_auth import databricks_request_headers
 from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
 
@@ -12,6 +13,11 @@ if TYPE_CHECKING:
     from omnigent_client import SessionsNamespace
 
 logger = logging.getLogger(__name__)
+
+
+def pin_remote_launch_host(sessions: SessionsNamespace, host_id: str) -> None:
+    """Route this CLI session's creation and later requests to its selected host."""
+    sessions._http.headers.update(databricks_request_headers(sessions._base, host_id=host_id))
 
 
 class LaunchHostError(RuntimeError):
