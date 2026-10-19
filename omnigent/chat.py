@@ -76,6 +76,7 @@ from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
+from omnigent.util.server_url import display_server_url
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
@@ -1460,8 +1461,6 @@ def _discovery_error(
     base_url: str, path: str, detail: str, *, what: str = "Agent discovery"
 ) -> click.ClickException:
     """Build the CLI error for a server listing or lookup the client cannot use."""
-    from omnigent.util.server_url import display_server_url
-
     return _server_setup_error(
         f"{what} failed: GET {path} on {display_server_url(base_url)} {detail}."
     )
@@ -1493,7 +1492,7 @@ def _discovery_get(
         # or a proxy environment httpx cannot parse is an environment problem,
         # not a crash. Same guard as the daemon path
         # (_prepare_chat_session_via_daemon).
-        raise click.ClickException(_unreachable_server_message(base_url)) from exc
+        raise _server_setup_error(_unreachable_server_message(base_url)) from exc
     except httpx.TransportError as exc:
         # The connection was made but the response never fully arrived.
         raise _discovery_error(
@@ -1502,9 +1501,19 @@ def _discovery_get(
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise _discovery_error(
-            base_url, path, f"returned HTTP {exc.response.status_code}", what=what
-        ) from exc
+        status = exc.response.status_code
+        detail = f"returned HTTP {status}"
+        if status == 401:
+            detail += (
+                f". Sign in with `{cli_invocation()} login {display_server_url(base_url)}`, "
+                "then retry"
+            )
+        elif status == 403:
+            detail += (
+                ". Check that you are using the intended account and ask the server "
+                "administrator to grant access"
+            )
+        raise _discovery_error(base_url, path, detail, what=what) from exc
     try:
         body = resp.json()
     except ValueError as exc:

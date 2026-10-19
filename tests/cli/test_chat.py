@@ -1833,6 +1833,7 @@ def test_pick_agent_reports_unreachable_server_as_click_error(
     assert server_url in message
     # The advice differs for a stopped local server vs a bad remote target.
     assert expected_hint in message
+    assert suppresses_recovery_hint(excinfo.value)
 
 
 # ── agent discovery on a server without sessions ─────────────────────
@@ -2277,17 +2278,29 @@ def test_pick_agent_menu_accepts_a_typed_name(
     assert "Available agents" in out and "2. scribe" in out
 
 
+@pytest.mark.parametrize(
+    ("status", "expected_hint"),
+    [
+        (401, "Sign in with `omnigent login https://example.databricks.com/omnigent`"),
+        (403, "ask the server administrator to grant access"),
+        (404, None),
+        (500, None),
+    ],
+)
 def test_pick_agent_reports_a_failed_listing_as_a_cli_error(
+    status: int,
+    expected_hint: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An HTTP error from the catalog is a clean CLI error, hint withheld."""
+    """Catalog errors retain HTTP context and offer status-specific recovery."""
     failing_route = "/v1/agents"
+    server_url = "https://example.databricks.com/api/2.0/omnigent"
 
     def _get(url: str, **_kwargs: object) -> SimpleNamespace:
         if not url.endswith(failing_route):
             return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"data": []})
         request = httpx.Request("GET", url)
-        response = httpx.Response(404, request=request)
+        response = httpx.Response(status, request=request)
 
         def _raise() -> None:
             raise httpx.HTTPStatusError("not found", request=request, response=response)
@@ -2297,11 +2310,18 @@ def test_pick_agent_reports_a_failed_listing_as_a_cli_error(
     monkeypatch.setattr(chat_module.httpx, "get", _get)
 
     with pytest.raises(click.ClickException) as excinfo:
-        _pick_agent("http://127.0.0.1:6767")
+        _pick_agent(server_url)
 
     message = str(excinfo.value)
     assert "Agent discovery failed" in message
-    assert failing_route in message and "404" in message
+    assert failing_route in message and f"HTTP {status}" in message
+    assert "https://example.databricks.com/omnigent" in message
+    assert "/api/2.0/omnigent" not in message
+    if expected_hint is not None:
+        assert expected_hint in message
+    if status != 401:
+        assert "login" not in message
+    assert isinstance(excinfo.value.__cause__, httpx.HTTPStatusError)
     assert suppresses_recovery_hint(excinfo.value)
 
 

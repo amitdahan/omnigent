@@ -12490,7 +12490,7 @@ def _workspace_api_server_url(server: str) -> str:
         return server
     try:
         probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
-    except _httpx.HTTPError:
+    except (_httpx.HTTPError, _httpx.InvalidURL):
         return server
     # Already something we understand at the root: an omnigent server
     # (200 / 401-with-login_url JSON) or a Databricks Apps edge /
