@@ -179,6 +179,15 @@ class TestToUiResponse:
             "value": "Allow",
         }
 
+    @pytest.mark.parametrize("answer", ["Unlisted", ["", "Unlisted"]])
+    def test_select_rejects_unlisted_api_answer(self, answer: object) -> None:
+        result = ElicitationResult(action="accept", content={"0": answer})
+        assert to_ui_response(_SELECT, result)["cancelled"] is True
+
+    def test_select_ignores_empty_answer_entries(self) -> None:
+        result = ElicitationResult(action="accept", content={"0": ["", "Allow"]})
+        assert to_ui_response(_SELECT, result)["value"] == "Allow"
+
     def test_select_accept_falls_back_to_question_text_key(self) -> None:
         result = ElicitationResult(action="accept", content={"Allow dangerous command?": "Block"})
         assert to_ui_response(_SELECT, result)["value"] == "Block"

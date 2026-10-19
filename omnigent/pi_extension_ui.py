@@ -112,7 +112,8 @@ def to_ui_response(
     if result is None or result.action != "accept":
         return {"type": "extension_ui_response", "id": req_id, "cancelled": True}
     value = _accepted_text(req, result)
-    if value is None:
+    labels = _select_labels(req) if method == "select" else []
+    if value is None or (labels and value not in labels):
         return {"type": "extension_ui_response", "id": req_id, "cancelled": True}
     return {"type": "extension_ui_response", "id": req_id, "value": value}
 
@@ -143,8 +144,7 @@ def _ask_user_question(req: dict[str, Any], method: object) -> dict[str, Any]:
         options = [option]
         header = "Editor"
     else:
-        # Custom-row only. A dummy radio (placeholder / "Enter text") was
-        # selectable and submitted as the Pi value without the user typing.
+        # A placeholder radio could be submitted without the user typing.
         options = []
         header = _nonempty_str(req.get("placeholder")) or "Input"
     question: dict[str, Any] = {

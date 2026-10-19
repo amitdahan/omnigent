@@ -34,7 +34,7 @@ const harnesses = [];
 // latestContext, ...).
 function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
-  const configPath = path.join(inboxDir, "config.json");
+  const configPath = path.join(inboxDir, "config");
   // A serverUrl + sessionId make postEvent attempt a real fetch; with a mock
   // global fetch that lets a test capture the posted event bodies. Without
   // them postEvent fails closed (the interrupt tests rely on that).
@@ -545,14 +545,24 @@ async function testTuiWrapParksConfirmWithoutCallingOriginal() {
 async function testTuiWrapReparksSameElicitationId() {
   const h = makeHarness({ captureEvents: true });
   const ids = [];
+  const headers = [];
+  const configPath = path.join(h.inboxDir, "config");
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const setToken = (token) => fs.writeFileSync(configPath, JSON.stringify({ ...config, authHeaders: { authorization: token } }));
+  setToken("first-token");
   let n = 0;
   global.fetch = async (url, opts) => {
     const u = String(url);
     if (u.includes("pi-extension-ui") || u.includes("/hook/pi/")) {
       const body = JSON.parse(opts.body);
       ids.push(body.elicitation_id);
+      headers.push(opts.headers.authorization);
+      assert("caller timeout reaches the server", body.request.timeout === 6000);
       n += 1;
-      if (n === 1) return { ok: true, status: 200, text: async () => "" };
+      if (n === 1) {
+        setToken("rotated-token");
+        return { ok: true, status: 200, text: async () => "" };
+      }
       return {
         ok: true,
         status: 200,
@@ -564,9 +574,21 @@ async function testTuiWrapReparksSameElicitationId() {
   const { ui } = mockUi();
   const ctx = { mode: "tui", ui };
   await h.handlers.session_start({}, ctx);
-  const value = await ctx.ui.select("Allow dangerous command?", ["Allow", "Block"]);
+  const value = await ctx.ui.select("Allow dangerous command?", ["Allow", "Block"], { timeout: 6000 });
   assert("select returns chosen label", value === "Allow", `value=${value}`);
   assert("re-park used the same elicitation id", ids.length === 2 && ids[0] === ids[1], JSON.stringify(ids));
+  assert("re-park rereads the current bearer", JSON.stringify(headers) === JSON.stringify(["first-token", "rotated-token"]), JSON.stringify(headers));
+}
+
+async function testSelectValidatesApiAnswer() {
+  for (const [answer, expected] of [["Unlisted", undefined], [["", 42, "Allow"], "Allow"]]) {
+    const h = makeHarness({ captureEvents: true });
+    global.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ action: "accept", content: { "0": answer } }) });
+    const { ui } = mockUi();
+    const ctx = { mode: "tui", ui };
+    await h.handlers.session_start({}, ctx);
+    assert("select preserves its option contract", await ctx.ui.select("Choice?", ["Allow", "Block"]) === expected);
+  }
 }
 
 async function testEmptyReparkBacksOff() {
@@ -790,6 +812,7 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
     await testAgentStartClearsStaleWindow();
     await testTuiWrapParksConfirmWithoutCallingOriginal();
     await testTuiWrapReparksSameElicitationId();
+    await testSelectValidatesApiAnswer();
     await testEmptyReparkBacksOff();
     await testEditorHonoursOpts();
     await testActiveDialogCancellation();

@@ -195,8 +195,16 @@ function extensionUiJsResult(method, verdict, request) {
   if (value == null && request && typeof request.title === "string") {
     value = content[request.title];
   }
-  if (Array.isArray(value)) value = value[0];
+  if (Array.isArray(value)) {
+    value = value.find((entry) => typeof entry === "string" && entry);
+  }
   if (typeof value !== "string" || !value) return undefined;
+  const labels = Array.isArray(request.options)
+    ? request.options.filter((entry) => typeof entry === "string" && entry)
+    : [];
+  if (method === "select" && labels.length && !labels.includes(value)) {
+    return undefined;
+  }
   if (method === "editor" && value === _KEEP_AS_IS_LABEL) {
     return typeof request.prefill === "string" ? request.prefill : "";
   }
@@ -233,8 +241,9 @@ async function parkPiExtensionUiHttp(config, request, opts) {
     ? `${relay.url}/hook/pi/extension-ui`
     : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/pi-extension-ui`;
   const elicitationId = mintPiUiElicitationId();
-  const body = JSON.stringify({ elicitation_id: elicitationId, request });
-  const reqHeaders = relay
+  const fullRequest = timeoutMs != null ? { ...request, timeout: timeoutMs } : request;
+  const body = JSON.stringify({ elicitation_id: elicitationId, request: fullRequest });
+  const requestHeaders = () => relay
     ? {
         "content-type": "application/json",
         authorization: `Bearer ${relay.token}`,
@@ -271,7 +280,7 @@ async function parkPiExtensionUiHttp(config, request, opts) {
     try {
       resp = await fetch(url, {
         method: "POST",
-        headers: reqHeaders,
+        headers: requestHeaders(),
         body,
         ...(controller ? { signal: controller.signal } : {}),
       });

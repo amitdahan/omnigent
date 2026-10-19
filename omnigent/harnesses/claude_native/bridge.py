@@ -7107,8 +7107,11 @@ def _tool_relay_handler_factory(
                 while not future.done():
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Pi dialog wait expired")
-                    readable, _, _ = select.select([self.connection], [], [], 0.1)
-                    if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                    try:
+                        readable, _, _ = select.select([self.connection], [], [], 0.1)
+                        if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                            return
+                    except OSError:
                         return
                 resp = future.result()
             except Exception as exc:  # noqa: BLE001

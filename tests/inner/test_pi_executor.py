@@ -5745,6 +5745,30 @@ def _assert_session_evicted(executor: PiExecutor, rpc: _PiRpcSession) -> None:
     assert rpc.process is None, "the pi process was not closed"
 
 
+def test_extension_answer_write_failure_evicts_waiting_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request", id="dialog", method="confirm", title="Continue?"
+            ),
+        ]
+    )
+    send = rpc.send_command
+
+    async def fail_answer(command: dict) -> None:
+        if command.get("type") == "extension_ui_response":
+            raise BrokenPipeError("test dialog response write failed")
+        await send(command)
+
+    monkeypatch.setattr(rpc, "send_command", fail_answer)
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, ExecutorError) for event in events)
+    _assert_session_evicted(executor, rpc)
+
+
 def _retry_recovery_frames(recovered: str) -> list[str]:
     """pi's frame sequence for a 503 that its automatic retry recovers from."""
     errored = _assistant_message(stop_reason="error", error_message=_RETRYABLE_503)

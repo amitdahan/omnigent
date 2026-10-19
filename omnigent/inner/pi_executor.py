@@ -3040,6 +3040,7 @@ class PiExecutor(Executor):
                 try:
                     await self._handle_extension_ui_request(event, rpc)
                 except Exception as exc:  # noqa: BLE001 — executor boundary
+                    await self._evict_rpc(session_key, rpc)
                     yield ExecutorError(message=f"Failed to answer Pi extension UI request: {exc}")
                     return
                 continue
