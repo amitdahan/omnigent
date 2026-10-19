@@ -39,8 +39,8 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   // global fetch that lets a test capture the posted event bodies. Without
   // them postEvent fails closed (the interrupt tests rely on that).
   const config = captureEvents
-    ? { inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
-    : { inboxDir };
+    ? { inboxDir, bridgeDir: inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
+    : { inboxDir, bridgeDir: inboxDir };
   fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -623,6 +623,46 @@ async function testEditorHonoursOpts() {
   assert("aborted editor posted no park", hookCalls.length === 0, JSON.stringify(hookCalls));
 }
 
+async function testActiveDialogCancellation() {
+  for (const phase of ["headers", "body", "backoff"]) {
+    const h = makeHarness({ captureEvents: true });
+    const { ui } = mockUi();
+    const ctx = { mode: "tui", ui };
+    const controller = new AbortController();
+    let requestStarted;
+    const started = new Promise((resolve) => { requestStarted = resolve; });
+    global.fetch = async (url, opts) => {
+      if (!String(url).includes("pi-extension-ui")) {
+        return { ok: true, status: 204, text: async () => "" };
+      }
+      const wait = () => new Promise((_, reject) => {
+        opts.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        requestStarted();
+      });
+      if (phase === "headers") return wait();
+      if (phase === "body") return { ok: true, status: 200, text: wait };
+      setTimeout(requestStarted, 10);
+      return { ok: false, status: 503, text: async () => "" };
+    };
+    await h.handlers.session_start({}, ctx);
+    const pending = ctx.ui.confirm("Continue?", "Test only", { signal: controller.signal, timeout: 2000 });
+    await started;
+    controller.abort();
+    let timer;
+    try {
+      const value = await Promise.race([
+        pending,
+        new Promise((resolve) => { timer = setTimeout(() => resolve("still-waiting"), 500); }),
+      ]);
+      assert(`${phase}: active abort returns cancellation`, value === false, String(value));
+    } finally {
+      clearTimeout(timer);
+    }
+    global.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ action: "accept" }) });
+    assert(`${phase}: a later dialog works`, await ctx.ui.confirm("Again?", "Test only") === true);
+  }
+}
+
 async function testRpcModeDoesNotWrapUi() {
   const h = makeHarness({ captureEvents: true });
   global.fetch = async () => ({ ok: true, status: 204, text: async () => "" });
@@ -648,8 +688,97 @@ async function testNotifyAndSetStatusStayUnwrapped() {
   );
 }
 
+async function testSessionStartupDoesNotCompleteATurn() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "saved-native-session" };
+
+  await h.handlers.session_start({}, ctx);
+
+  assert(
+    "starting an idle or resumed session does not report a completed turn",
+    statusEdges(h.postedEvents).length === 0,
+    JSON.stringify(statusEdges(h.postedEvents)),
+  );
+}
+
+async function testSessionStartMarksInputReady() {
+  const h = makeHarness();
+  const marker = path.join(h.inboxDir, "input_ready");
+  assert("input-ready marker is absent before session_start", !fs.existsSync(marker));
+
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+
+  assert(
+    "session_start writes the input-ready marker once the inbox poller is armed",
+    fs.existsSync(marker) && !!h.pi.__omnigentInboxPoller,
+  );
+}
+
+async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "queued-native-session" };
+  const captureFetch = global.fetch;
+  let releaseStartupPatch;
+  const startupPatchPending = new Promise((resolve) => {
+    releaseStartupPatch = resolve;
+  });
+  global.fetch = async (url, opts) => {
+    if (opts.method === "PATCH") await startupPatchPending;
+    return captureFetch(url, opts);
+  };
+  let agentStartPromise;
+  h.pi.sendUserMessage = () => {
+    ctx.isIdle = () => false;
+    agentStartPromise = h.handlers.agent_start({}, ctx);
+  };
+  const payloadPath = path.join(h.inboxDir, "first-prompt.json");
+  fs.writeFileSync(
+    payloadPath,
+    JSON.stringify({ id: "first-prompt", type: "user_message", content: "Run the task" }),
+  );
+  const startup = h.handlers.session_start({}, ctx);
+  try {
+    const deadline = Date.now() + 3000;
+    while (fs.existsSync(payloadPath)) {
+      if (Date.now() > deadline) throw new Error("startup prompt was not consumed by poller");
+      await sleep(20);
+    }
+    if (!agentStartPromise) throw new Error("the queued prompt did not start an agent loop");
+    await agentStartPromise;
+    releaseStartupPatch();
+    await startup;
+
+    const beforeEnd = statusEdges(h.postedEvents);
+    assert(
+      "finishing startup preserves the queued prompt's running turn",
+      beforeEnd.length === 1 && beforeEnd[0].status === "running",
+      JSON.stringify(beforeEnd),
+    );
+
+    await h.handlers.agent_end({ messages: [] }, ctx);
+    const afterEnd = statusEdges(h.postedEvents);
+    assert(
+      "only agent_end completes the queued prompt with the same response_id",
+      afterEnd.length === 2 &&
+        afterEnd[0].status === "running" &&
+        afterEnd[1].status === "idle" &&
+        afterEnd[0].responseId === afterEnd[1].responseId,
+      JSON.stringify(afterEnd),
+    );
+  } finally {
+    releaseStartupPatch();
+    await startup;
+    global.fetch = captureFetch;
+  }
+}
+
 (async () => {
   try {
+    await testSessionStartupDoesNotCompleteATurn();
+    await testSessionStartMarksInputReady();
+    await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();
@@ -663,6 +792,7 @@ async function testNotifyAndSetStatusStayUnwrapped() {
     await testTuiWrapReparksSameElicitationId();
     await testEmptyReparkBacksOff();
     await testEditorHonoursOpts();
+    await testActiveDialogCancellation();
     await testRpcModeDoesNotWrapUi();
     await testNotifyAndSetStatusStayUnwrapped();
   } finally {
