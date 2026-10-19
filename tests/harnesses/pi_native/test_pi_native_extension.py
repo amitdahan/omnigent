@@ -16,7 +16,7 @@ def test_pi_native_extension_js_unit_suite() -> None:
     if node is None:
         pytest.skip("node is required for the pi-native extension unit tests")
     script = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
