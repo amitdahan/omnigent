@@ -1074,17 +1074,18 @@ def test_detect_host_backend_none_without_signals(
     assert _should_bind_host_proc() is False
 
 
-def test_detect_host_backend_env_declaration_is_normalised(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("declared", ["  LakeBox  ", "KUBERNETES"])
+def test_detect_host_backend_env_declaration_is_normalised_and_vetted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, declared: str
 ) -> None:
     """
     ``OMNIGENT_HOST_SANDBOX_BACKEND`` is the explicit, authoritative
-    signal; it is trimmed and lower-cased so callers don't have to match
-    an exact casing, and ``lakebox`` is on the proc-bind allow-list.
+    signal; it is trimmed and lower-cased before checking the proc-bind
+    allow-list.
     """
     _clear_host_backend_signals(monkeypatch, tmp_path)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "  LakeBox  ")
-    assert _detect_host_sandbox_backend() == "lakebox"
+    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, declared)
+    assert _detect_host_sandbox_backend() == declared.strip().lower()
     assert _should_bind_host_proc() is True
 
 

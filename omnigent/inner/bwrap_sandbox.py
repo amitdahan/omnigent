@@ -202,7 +202,7 @@ _ALLOWED_SOCKET_FAMILIES = (
 # single-tenant dev microVM (Lakebox) but not on an arbitrary host, so the
 # downgrade is only taken for vetted backends. Add entries here as more
 # backends are verified safe.
-_PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox"})
+_PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"kubernetes", "lakebox"})
 
 # Env var an outer launcher may set to name the host's outer sandbox
 # backend (e.g. ``lakebox``). Authoritative when present; otherwise the
@@ -251,7 +251,7 @@ def _should_bind_host_proc() -> bool:
     mounting a fresh procfs.
 
     ``True`` only when the host runs under an outer sandbox backend in
-    :data:`_PROC_BIND_HOST_BACKENDS` (lakebox today). On every other host
+    :data:`_PROC_BIND_HOST_BACKENDS`. On every other host
     the fresh-proc mount is kept, so ordinary hosts — and their fail-closed
     behaviour when a fresh procfs mount is denied — are unchanged.
 
