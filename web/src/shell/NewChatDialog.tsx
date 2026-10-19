@@ -2443,7 +2443,6 @@ export function NewChatLandingScreen() {
   // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
   // set, the picker offers connecting the user's Arca dev instance as a host.
   const [arcaEnabled, setArcaEnabled] = useState(false);
-  const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
   const [connectingArca, setConnectingArca] = useState(false);
   const [arcaError, setArcaError] = useState<string | null>(null);
   // Mirrors pendingConnectRef for the Arca row: connect after the menu closes.
@@ -2741,10 +2740,7 @@ export function NewChatLandingScreen() {
     if (!isElectronShell()) return;
     let cancelled = false;
     void getDesktopFeatures().then((features) => {
-      if (!cancelled) {
-        setArcaEnabled(features?.databricksInternalFeatures === true);
-        setArcaPreviewRecovery(features?.arcaPreviewRecovery === true);
-      }
+      if (!cancelled) setArcaEnabled(features?.databricksInternalFeatures === true);
     });
     return () => {
       cancelled = true;
@@ -5035,11 +5031,10 @@ export function NewChatLandingScreen() {
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
-  // A recovery-capable desktop restores preview identity on demand. Older
-  // shells keep Run on Arca visible because reconnecting is their only recovery.
+  // Run on Arca is offered only while that host isn't online.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
-  const showArcaOption = arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
+  const showArcaOption = arcaEnabled && !arcaHostOnline;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca
@@ -5941,9 +5936,7 @@ export function NewChatLandingScreen() {
     : "Describe a task to start a new session…";
 
   const isCloudHostEntry = (host: Host) =>
-    host.host_id === arcaHostId ||
-    !!host.sandbox_provider ||
-    host.name.toLowerCase().includes("cloud");
+    !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
   const isReconnectRow = (host: Host) =>
     host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
   // Keep the selected host and this machine's reconnect action above the fold.

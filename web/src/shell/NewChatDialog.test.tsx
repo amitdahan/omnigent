@@ -3023,7 +3023,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
   });
 
-  it("hides Run on Arca while preserving the remembered online host row", async () => {
+  it("lists the remembered online host under My machines and hides Run on Arca", async () => {
     // The row is recognized by the host id remembered at connect time — a
     // host's name (machine hostname) is deliberately not matched against
     // anything from `arca status`.
@@ -3034,21 +3034,29 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
 
     const row = await screen.findByTestId("new-chat-landing-host-arca-1");
     expect(row.textContent).toContain("Arca instance");
+    // As in the browser picker: a My machines row with a status dot, not a
+    // Cloud row with the cloud icon.
+    expect(
+      screen.getByText("My machines").compareDocumentPosition(row) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText("Cloud")).toBeNull();
+    expect(row.querySelector(".bg-success")).not.toBeNull();
+    expect(row.querySelector("svg")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
     fireEvent.click(row);
     await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
   });
 
-  it("keeps Run on Arca visible in an older shell without preview recovery", async () => {
+  it("hides Run on Arca while the remembered host is online, even in an older shell", async () => {
     vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
     localStorage.setItem("omnigent:arca-host-id", "arca-1");
     mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "online" }]);
     renderLanding();
     await openHostMenu();
 
-    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
-      /^Run on Arca$/,
-    );
+    expect(await screen.findByTestId("new-chat-landing-host-arca-1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
   });
 
   it("recaptures an already-running host through the same reconnect action", async () => {
