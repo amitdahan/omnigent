@@ -185,15 +185,8 @@ _ALLOWED_SOCKET_FAMILIES = (
 # Nested-sandbox /proc handling
 # ---------------------------------------------------------------------------
 
-# Outer sandbox backends whose microVM/container permits binding the
-# existing ``/proc`` but forbids mounting a FRESH procfs under
-# ``--unshare-pid`` (masked ``/proc`` overmounts make ``mount proc``
-# return EPERM). On these backends the bwrap wrap binds the host
-# ``/proc`` instead of emitting ``--proc /proc``.
-#
-# Binding outer ``/proc`` exposes process metadata, so only vetted single-tenant
-# sandboxes may opt in. Kubernetes requires isolated PID namespaces: no
-# ``hostPID`` or ``shareProcessNamespace``.
+# Vetted backends that deny fresh procfs; binding exposes outer process metadata.
+# Kubernetes pods must not use ``hostPID`` or ``shareProcessNamespace``.
 _PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"kubernetes", "lakebox"})
 
 # Launcher-declared outer backend; overrides autodetection. ``resolve()`` reads
