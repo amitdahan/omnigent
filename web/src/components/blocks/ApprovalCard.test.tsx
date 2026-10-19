@@ -204,9 +204,7 @@ describe("ApprovalCard — binary approve/reject", () => {
   });
 
   it("keeps the blank line between a Pi confirm's title and message", () => {
-    // The Pi extension-UI mapper composes a confirm dialog as
-    // "title\n\nmessage"; HTML collapses that break unless the message
-    // renders with pre-line whitespace.
+    // Pi confirm dialogs need pre-line whitespace to preserve title/message breaks.
     render(
       <ApprovalCard
         elicitationId="elic_pi_confirm_newline"

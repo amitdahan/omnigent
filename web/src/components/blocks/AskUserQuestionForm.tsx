@@ -1,33 +1,5 @@
-// Interactive form for Claude Code's built-in ``AskUserQuestion``
-// tool. Rendered inside the existing ``ApprovalCard`` when the
-// PermissionRequest carries a structured ``ask_user_question``
-// payload — see :file:`@/lib/askUserQuestion`.
-//
-// **Carousel** layout: only one question is visible at a time with
-// Prev / Next / Submit navigation. ``Question N of M`` indicator
-// keeps progress legible without stacking N fieldsets vertically.
-//
-// Each question section renders:
-//   - the question text in primary foreground color + an optional
-//     ``header`` badge in muted text
-//   - radio inputs (single-select) or checkboxes (multi-select)
-//     for the predefined options, with each option's description
-//     under the label in muted text
-//   - when ``isOther !== false``, a "Type something" custom-input
-//     row at the bottom of the option list — same radio/checkbox
-//     prefix as the real options, so visually it's "one more
-//     option" whose value the user types. The radio/checkbox is
-//     part of the same group as the predefined options
-//     (single-select mutex; multi-select independent toggle).
-//   - <pre> blocks showing the ``preview`` of any currently-selected
-//     option that has one (single-select: 0 or 1; multi-select:
-//     one per selected option with a preview).
-//
-// Submit is gated on EVERY question having an answer (a predefined
-// option selected, or the custom row selected with non-empty text).
-// Selections are gathered into a flat ``{[question id or text]:
-// answer}`` map matching MCP's ``ElicitResult.content`` shape and
-// passed to ``onSubmit``.
+// Question carousel for structured elicitation, with single- or multi-select answers.
+// isOther controls custom input; submit requires an answer to every question.
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
 import { type ChangeEvent, useState } from "react";

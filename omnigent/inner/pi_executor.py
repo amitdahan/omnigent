@@ -190,11 +190,8 @@ NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
     Awaitable[dict[str, Any]] | dict[str, Any],
 ]
 
-# Form elicitation bridge for Pi ``extension_ui_request`` dialogs. Wired by
-# :class:`omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter` to
-# ``ctx.elicit``; returns the web ``ElicitationResult`` (not a bool). Decline
-# must not abort the turn — a permission-gate ``select`` is one blocked tool,
-# not a killed session.
+# ExecutorAdapter connects Pi dialogs to ctx.elicit. Return the typed result
+# so the extension can handle a decline without aborting the turn.
 FormElicitationHandler: TypeAlias = Callable[  # type: ignore[explicit-any]
     [Any],
     Awaitable[Any],

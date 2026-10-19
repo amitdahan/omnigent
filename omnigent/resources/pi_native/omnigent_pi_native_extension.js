@@ -212,14 +212,8 @@ function extensionUiJsResult(method, verdict, request) {
 }
 
 /**
- * Park a Pi TUI dialog on Omnigent's web elicitation hook.
- *
- * Same undici-safe re-attach loop as ``evalNativePolicyHttp``. Empty 200
- * (timeout / disconnect) re-POSTs the same elicitation id. A JSON body
- * with ``action`` is the web verdict. Fail closed (null) when the gate
- * cannot be reached so the wrap does not fall through to the TUI prompt
- * (that hang is the bug).
- *
+ * Park a native dialog on the web hook, reattaching the same ID after empty responses.
+ * Return null on cancellation or failure so the caller cannot hang on a TUI prompt.
  * @returns {Promise<object | null>} ElicitationResult, or null on cancel.
  */
 async function parkPiExtensionUiHttp(config, request, opts) {
