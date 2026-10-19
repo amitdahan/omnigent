@@ -5,7 +5,7 @@ agents registered, so the CLI has no local bundle to upload.  Session
 creation must therefore bind by ``agent_id`` through the JSON
 ``POST /v1/sessions`` route rather than the multipart bundle route.
 
-Three paths are covered:
+The following paths are covered:
 
 1. **Interactive fresh session.** ``_SessionsChatReplAdapter`` with
    ``session_bundle=None`` resolves the registered ``agent_id`` and creates
@@ -18,6 +18,8 @@ Three paths are covered:
 4. **Fresh server.** Agent discovery and the ``omnigent run --server`` one-shot
    work against a server whose agents are registered but which has no
    sessions yet, and a server without an online runner fails cleanly.
+5. **Connected host.** Both the one-shot CLI and the interactive terminal
+   launch a runner on this machine's host when no matching runner is online.
 
 Run locally (mock LLM, no real API key needed)::
 
@@ -650,14 +652,17 @@ def _wait_until(predicate: object, *, timeout: float, what: str) -> None:
     raise AssertionError(f"timed out waiting for {what}")
 
 
-def test_run_one_shot_launches_a_runner_on_this_machines_host(
+@pytest.mark.parametrize("interactive", [False, True], ids=["one-shot", "interactive"])
+def test_run_launches_a_runner_on_this_machines_host(
     mock_llm_server_url: str | None,
     tmp_path: Path,
+    interactive: bool,
 ) -> None:
     """With only a connected host (no runner), the CLI has the server launch one there.
 
     The CLI and ``omnigent host`` share a home, so the CLI is "this machine's"
-    host. The one-shot must answer through the launched runner and then stop it.
+    host. Both entry points must answer through the launched runner. Only the
+    one-shot stops it on exit; interactive runners keep the host-owned lifecycle.
     """
     suffix = uuid.uuid4().hex[:6]
     agent_name = f"host-launch-{suffix}"
@@ -687,28 +692,97 @@ def test_run_one_shot_launches_a_runner_on_this_machines_host(
             with httpx.Client(base_url=url, timeout=10.0) as client:
                 host.wait_online(client, timeout=90.0)
                 assert client.get("/v1/runners").json()["data"] == []
-
-                proc = _run_cli(
-                    host.home,
-                    "run",
-                    "--server",
-                    url,
-                    "--agent",
-                    agent_name,
-                    "-p",
-                    "hi",
-                    timeout=180.0,
+                registered_id = next(
+                    agent["id"]
+                    for agent in client.get("/v1/agents").json()["data"]
+                    if agent["name"] == agent_name
                 )
-                output = proc.stdout + proc.stderr
-                assert proc.returncode == 0, output + host.log_path.read_text()
-                assert marker in proc.stdout, output
+
+                if interactive:
+                    pexpect = pytest.importorskip("pexpect")
+                    config = host.home / ".omnigent" / "config.yaml"
+                    config.write_text(
+                        config.read_text()
+                        + "\nauto_open_conversation: false\ntui:\n  theme: dark\n"
+                    )
+                    env = isolated_process_env(
+                        host.home,
+                        {"TERM": "xterm-256color", "OMNIGENT_NO_UPDATE_CHECK": "1"},
+                        None,
+                    )
+                    with (tmp_path / "repl.log").open("w") as transcript:
+                        child = pexpect.spawn(
+                            sys.executable,
+                            [
+                                "-c",
+                                "from omnigent.cli import main\n\nmain()\n",
+                                "run",
+                                "--server",
+                                url,
+                                "--agent",
+                                agent_name,
+                            ],
+                            env=env,
+                            encoding="utf-8",
+                            dimensions=(40, 120),
+                            timeout=120,
+                        )
+                        child.logfile_read = transcript
+                        try:
+                            child.expect(r"Ctrl.C exit")
+                            child.send("hi\r")
+                            child.expect(marker)
+                            _wait_until(
+                                lambda: any(
+                                    session.get("status") == "idle"
+                                    for session in client.get(
+                                        "/v1/sessions", params={"visibility": "all"}
+                                    ).json()["data"]
+                                ),
+                                timeout=30.0,
+                                what="interactive turn to finish",
+                            )
+                            child.sendcontrol("d")
+                            child.expect(pexpect.EOF)
+                            child.close()
+                            assert child.exitstatus == 0
+                        finally:
+                            child.close(force=True)
+                else:
+                    proc = _run_cli(
+                        host.home,
+                        "run",
+                        "--server",
+                        url,
+                        "--agent",
+                        agent_name,
+                        "-p",
+                        "hi",
+                        timeout=180.0,
+                    )
+                    output = proc.stdout + proc.stderr
+                    assert proc.returncode == 0, output + host.log_path.read_text()
+                    assert marker in proc.stdout, output
 
                 sessions = client.get(
                     "/v1/sessions", params={"visibility": "all", "limit": 10}
                 ).json()["data"]
                 assert len(sessions) == 1, sessions
                 assert sessions[0].get("host_id") == host.host_id, sessions
-                # The one-shot stops the runner it caused the host to launch.
+                assert sessions[0]["agent_id"] == registered_id, sessions
+                assert sessions[0]["workspace"] == os.getcwd(), sessions
+                if interactive:
+                    assert marker in _assistant_text(url, sessions[0]["id"])
+                    assert any(
+                        runner.get("online") for runner in client.get("/v1/runners").json()["data"]
+                    )
+                    response = client.post(
+                        f"/v1/sessions/{sessions[0]['id']}/events",
+                        json={"type": "stop_session", "data": {}},
+                        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+                    )
+                    response.raise_for_status()
+                # The one-shot or the test stops only its own launched runner.
                 _wait_until(
                     lambda: (
                         not any(r.get("online") for r in client.get("/v1/runners").json()["data"])

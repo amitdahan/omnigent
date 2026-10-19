@@ -1102,18 +1102,21 @@ def _chat_with_server(
     ):
         return
 
-    if agent_name is None and resume_conversation_id is not None:
+    source_session_id = resume_conversation_id or fork_session_id
+    if agent_name is None and source_session_id is not None:
         # A resumed session already has its agent; asking would risk picking
         # another one and adopting a runner for the wrong harness. A failed
         # lookup surfaces as a discovery error naming the session.
         snapshot = _discovery_get(
             base_url,
-            f"/v1/sessions/{urllib.parse.quote(resume_conversation_id, safe='')}",
+            f"/v1/sessions/{urllib.parse.quote(source_session_id, safe='')}",
             {},
-            what=f"Session {resume_conversation_id} lookup",
+            what=f"Session {source_session_id} lookup",
         )
         session_agent = snapshot.get("agent_name")
         agent_name = session_agent if isinstance(session_agent, str) and session_agent else None
+        if agent_name is None and fork_session_id is not None:
+            agent_name = "agent"
         if agent_name is None and initial_message is not None:
             from omnigent.util.server_url import display_server_url
 

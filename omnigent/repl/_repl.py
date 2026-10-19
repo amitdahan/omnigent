@@ -70,6 +70,8 @@ from rich.markup import escape
 from rich.text import Text
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.remote_launch import resolve_remote_launch_host
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -1736,9 +1738,9 @@ class _SessionsChatReplAdapter:
 
         The remote-URL path: there is no local bundle to upload, so use
         the selected catalog identity or resolve the name for direct callers.
-        A remote client also has no runner of its own, so adopt one the
-        server already has online — otherwise the first turn fails the
-        runner-binding precondition.
+        Adopt a matching online runner, or ask the server to launch one
+        on this machine's connected host. Host-launched runners arrive
+        bound to the session and remain owned by the host lifecycle.
 
         :param pending_debug: Whether to emit adapter debug lines.
         :returns: None.
@@ -1763,13 +1765,22 @@ class _SessionsChatReplAdapter:
         agent_id = self._agent_id or (agent.id if agent is not None else None)
         if agent_id is None:
             raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
+        launch_host_id: str | None = None
         if self._runner_id is None:
-            from omnigent.harness_aliases import canonicalize_harness
-
             self._runner_id = await self._client.sessions.resolve_online_runner(
                 harness=agent.harness if agent is not None else None,
                 canonicalize=lambda name: canonicalize_harness(name) or name,
             )
+            if self._runner_id is None:
+                launch_host_id = await resolve_remote_launch_host(
+                    self._client.sessions, harness=agent.harness if agent is not None else None
+                )
+                if launch_host_id is None:
+                    raise RuntimeError(
+                        "This server has no online runner to run the turn. Start one "
+                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
+                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
+                    )
             if pending_debug:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
@@ -1783,6 +1794,7 @@ class _SessionsChatReplAdapter:
             agent_id,
             reasoning_effort=self._reasoning_effort,
             workspace=os.getcwd(),
+            host_id=launch_host_id,
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)

@@ -2241,6 +2241,45 @@ def test_chat_with_server_headless_resume_reports_a_failed_session_lookup(
     assert "does not report its agent" not in message
 
 
+@pytest.mark.parametrize("session_agent", ["uploaded-only", None])
+@pytest.mark.parametrize("catalog_status", [200, 500])
+def test_chat_with_server_fork_uses_source_not_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    session_agent: str | None,
+    catalog_status: int,
+) -> None:
+    """Forking uses the source snapshot even if the catalog is broken or ambiguous."""
+    requests: list[str] = []
+    dispatched: dict[str, object] = {}
+
+    def _get(url: str, **_kwargs: object) -> httpx.Response:
+        requests.append(url)
+        if url.endswith("/v1/sessions/conv_source"):
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", url),
+                json={"id": "conv_source", "agent_name": session_agent},
+            )
+        return httpx.Response(
+            catalog_status,
+            request=httpx.Request("GET", url),
+            json={"data": [{"id": "ag_one", "name": "one"}, {"id": "ag_two", "name": "two"}]},
+        )
+
+    def _repl(_base_url: str, agent_name: str, *_args: object, **kwargs: object) -> None:
+        dispatched.update(agent_name=agent_name, **kwargs)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+    monkeypatch.setattr(chat_module, "_run_repl", _repl)
+
+    chat_module._chat_with_server("http://127.0.0.1:6767", None, fork_session_id="conv_source")
+
+    assert requests == ["http://127.0.0.1:6767/v1/sessions/conv_source"]
+    assert dispatched["agent_name"] == (session_agent or "agent")
+    assert dispatched["fork_session_id"] == "conv_source"
+    assert dispatched["registered_agent"] is None
+
+
 def test_chat_with_server_interactive_resume_without_session_agent_offers_the_menu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
