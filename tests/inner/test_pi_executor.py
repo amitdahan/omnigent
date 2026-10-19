@@ -3943,9 +3943,7 @@ def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Pat
     assert disabled._with_bundle_context("Agent prompt.") == "Agent prompt."
     assert "--no-context-files" in disabled._extra_args
 
-    # With both files present the parser adopts AGENTS.md as the instructions
-    # while Pi's own precedence picks AGENTS.override.md; both reach the model,
-    # just as Pi layers a project context file over the instructions.
+    # Parser-adopted AGENTS.md and Pi's AGENTS.override.md context must both survive.
     (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         layered = PiExecutor(bundle_dir=bundle)

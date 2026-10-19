@@ -1831,23 +1831,10 @@ def _resolve_pi_bundle_extension_entries(extensions_dir: pathlib.Path) -> list[p
 
 
 def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[str]:
-    """
-    Expose a bundle's ``.pi/extensions`` to Pi via explicit ``--extension`` flags.
+    """Pass bundled extension entry files explicitly; Pi's cwd is the workspace.
 
-    Pi auto-discovers project-local extensions from its **process cwd**,
-    but the executor runs Pi in the session workspace — a directory
-    unrelated to the bundle's on-disk location — so bundled extensions
-    never load through discovery. This mirrors the explicit ``--skill``
-    mechanism. Entry files (see :func:`_resolve_pi_bundle_extension_entries`)
-    are passed rather than the directory because Pi treats a directory
-    ``--extension`` source as a *package root* (expecting ``extensions/`` /
-    ``skills/`` subdirs inside it), and a ``<bundle>/.pi`` package source
-    would also load ``.pi/skills`` in defiance of ``skills_filter="none"``.
-
-    Hook-style extensions (``before_agent_start`` and friends) take full
-    effect. Tools a bundled extension registers are loaded but not exposed to
-    the model: the executor runs Pi with ``--no-tools`` and allowlists only the
-    bridged Omnigent tools (plus ``read``) via ``--tools``.
+    Passing the .pi directory would also load skills outside skills_filter.
+    Extension hooks run normally; extension-defined tools remain excluded by --tools.
 
     :param bundle_dir: The agent bundle's extracted on-disk path.
         ``None`` when no bundle is available — no flags are emitted.
@@ -1867,14 +1854,10 @@ def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[s
 def _pi_bundle_resource_roots(
     bundle_dir: pathlib.Path | None, args: Sequence[str]
 ) -> list[pathlib.Path]:
-    """
-    Bundle directories a sandboxed Pi must read for the resources in *args*.
+    """Grant read access to bundle resources passed through --skill or --extension.
 
-    The runner extracts bundles under the host temp dir, which the sandbox
-    replaces with a private tmpfs, so each ``skills/``, ``.pi/skills/`` or
-    ``.pi/extensions/`` root that contributed a ``--skill`` / ``--extension``
-    path is granted read-only. The bundle root itself is never granted: the
-    dotfile mask would hide its ``.pi/`` entry.
+    Sandbox tmpfs hides extracted bundles. Grant resource roots individually;
+    granting the bundle root would leave .pi hidden by the dotfile mask.
 
     :param bundle_dir: The agent bundle's extracted on-disk path, or ``None``.
     :param args: The resolved Pi CLI tokens, e.g. ``self._extra_args``.
@@ -1900,15 +1883,9 @@ def _squash_ws(text: str) -> str:
 
 
 def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
-    """
-    Read the bundle-root context file Pi would have discovered in the bundle.
+    """Read the first readable bundle context file in Pi's precedence order.
 
-    Pi loads ``AGENTS.md``/``CLAUDE.md`` relative to its cwd (the session
-    workspace), so a context file at the bundle root is never seen. The
-    first candidate in Pi's own precedence order is read here and appended
-    to the composed system prompt by :meth:`PiExecutor._with_bundle_context`.
-    Content is used rather than a path so a sandboxed Pi that cannot see the
-    bundle appends nothing instead of the literal path string.
+    Pass its contents into the prompt: Pi's workspace cwd cannot discover the bundle.
 
     :param bundle_dir: The agent bundle's extracted on-disk path, or ``None``.
     :returns: The stripped file content of the first readable candidate, or
@@ -2754,12 +2731,9 @@ class PiExecutor(Executor):
         state.applied_thinking = thinking
 
     def _with_bundle_context(self, system_prompt: str) -> str:
-        """Append the bundle-root context file to Omnigent's composed prompt.
+        """Append bundle context unless the prompt already starts with it.
 
-        It goes after the composed prompt, where Pi itself places the project
-        context files it discovers. Skipped when the prompt starts with that
-        content (ignoring whitespace): the parser-adopted instructions open the
-        composed prompt, so that is where an already-adopted file appears.
+        The spec parser may have adopted the same file as the agent's instructions.
         """
         context = self._bundle_context
         if not context or _squash_ws(system_prompt).startswith(_squash_ws(context)):
