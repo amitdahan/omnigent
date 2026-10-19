@@ -18,8 +18,7 @@ Default view inside the sandbox:
   ``/etc/ld.so.cache``, ``/etc/ld.so.conf``,
   ``/etc/ld.so.conf.d``, ``/etc/ssl``, ``/etc/ca-certificates``,
   ``/etc/pki``) bound read-only via ``--ro-bind-try``.
-- Fresh ``/proc`` (bind-mounted from the host on outer sandboxes that
-  forbid a fresh procfs mount, e.g. Lakebox — see
+- Fresh ``/proc`` (or a bind from vetted outer sandboxes; see
   :func:`_should_bind_host_proc`), ``/dev``, and ``/tmp``.
 - Cwd bind-mounted read-only by default; explicit
   ``write_paths: ["."]`` flips it to read-write. Top-level
@@ -68,6 +67,7 @@ import os
 import shutil
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from ._cwd_scan import MaskedEntry, MaskKind, merge_scan_roots, scan_cwd_mask_entries
@@ -83,6 +83,7 @@ from ._seccomp import (
 )
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
     SandboxBackend,
     SandboxPolicy,
     register_backend,
@@ -185,17 +186,12 @@ _ALLOWED_SOCKET_FAMILIES = (
 # Nested-sandbox /proc handling
 # ---------------------------------------------------------------------------
 
-# Vetted backends that deny fresh procfs; binding exposes outer process metadata.
-# Kubernetes pods must not use ``hostPID`` or ``shareProcessNamespace``.
-_PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"kubernetes", "lakebox"})
-
-# Launcher-declared outer backend; overrides autodetection. ``resolve()`` reads
-# it before environment pruning to set ``SandboxPolicy.bind_host_proc``.
-_HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
+# Vetted backends that deny fresh procfs. Phoenix must keep pod PID isolation.
+_PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox", "phoenix-kubernetes"})
 
 # Marker directory the Databricks Lakebox runtime seeds inside every
 # microVM. Used to autodetect lakebox when the launcher hasn't declared the
-# backend via ``_HOST_SANDBOX_BACKEND_ENV``.
+# backend via :data:`HOST_SANDBOX_BACKEND_ENV`.
 _LAKEBOX_MARKER = Path("/run/lakebox")
 
 
@@ -212,7 +208,7 @@ def _detect_host_sandbox_backend() -> str | None:
     :returns: Lower-cased backend name (e.g. ``"lakebox"``), or ``None``
         when the host is not running under a recognised outer sandbox.
     """
-    declared = os.environ.get(_HOST_SANDBOX_BACKEND_ENV)
+    declared = os.environ.get(HOST_SANDBOX_BACKEND_ENV)
     if declared and declared.strip():
         return declared.strip().lower()
     try:
@@ -374,7 +370,6 @@ class BwrapSandboxBackend(SandboxBackend):
                 if sandbox_spec.env_passthrough is not None
                 else None
             ),
-            bind_host_proc=_should_bind_host_proc(),
             credential_proxy=sandbox_spec.credential_proxy,
             git_ssh=sandbox_spec.git_ssh,
         )
@@ -431,6 +426,7 @@ class BwrapSandboxBackend(SandboxBackend):
         ``SandboxPolicy.spawn_env_allowlist`` prune in
         :func:`omnigent.inner.sandbox.run_launcher`.
         """
+        policy = self.prepare_launcher_policy(policy)
         cwd_resolved = cwd.resolve(strict=False)
         chdir_target = chdir.resolve(strict=False) if chdir is not None else cwd_resolved
         bwrap_args: list[str] = ["bwrap"]
@@ -648,6 +644,12 @@ class BwrapSandboxBackend(SandboxBackend):
 
             return wrap_shared_namespace(bwrap_args, policy)
         return bwrap_args
+
+    def prepare_launcher_policy(self, policy: SandboxPolicy) -> SandboxPolicy:
+        """Resolve the proc mount on the machine building the bwrap argv."""
+        if policy.bind_host_proc is not None:
+            return policy
+        return replace(policy, bind_host_proc=_should_bind_host_proc())
 
     def activate(self, policy: SandboxPolicy) -> None:
         """

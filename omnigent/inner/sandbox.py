@@ -51,6 +51,10 @@ _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 # write root that merely happens to sit under the system tempdir.
 _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 
+# Trusted outer-launcher hint consumed before sandbox environment filtering.
+# It is never forwarded to agent targets.
+HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
+
 # Backends that need a spawn-time wrap (parent-side ``bwrap`` /
 # ``sandbox-exec`` invocation) in addition to whatever in-process
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
@@ -125,9 +129,8 @@ class SandboxPolicy:
         environment cannot leak it into the sandbox.
         ``None`` (the default) skips the prune for spawn sites that
         haven't opted in.
-    :param bind_host_proc: Whether bwrap should bind the outer ``/proc``
-        instead of mounting a fresh procfs. Resolved before launcher
-        environment pruning.
+    :param bind_host_proc: Parent-side bwrap choice, resolved on the process
+        that builds the launcher. ``None`` means it has not been resolved yet.
     :param egress_relay_port: TCP port the in-namespace relay listens
         on (loopback). Set when ``egress_rules`` is active; the helper
         starts a relay daemon on this port at activation time. C1
@@ -186,7 +189,9 @@ class SandboxPolicy:
     mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
-    bind_host_proc: bool = False
+    # Parent-side only: host-dependent state must not cross the policy wire
+    # from another machine.
+    bind_host_proc: bool | None = None
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
     git_ssh_socket_path: str | None = None
@@ -251,7 +256,6 @@ class SandboxPolicy:
                 if self.spawn_env_allowlist is not None
                 else None
             ),
-            "bind_host_proc": self.bind_host_proc,
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
             "git_ssh_socket_path": self.git_ssh_socket_path,
@@ -295,8 +299,6 @@ class SandboxPolicy:
         overflow = overflow_raw if isinstance(overflow_raw, str) else "warn"
         recursive_raw = data.get("cwd_hidden_scan_recursive", False)
         recursive = recursive_raw if isinstance(recursive_raw, bool) else False
-        bind_host_proc_raw = data.get("bind_host_proc", False)
-        bind_host_proc = bind_host_proc_raw if isinstance(bind_host_proc_raw, bool) else False
         mask_paths_data = data.get("mask_paths")
         mask_paths: list[Path] | None = None
         if isinstance(mask_paths_data, list):
@@ -356,7 +358,6 @@ class SandboxPolicy:
             mask_paths=mask_paths,
             env_passthrough=env_passthrough,
             spawn_env_allowlist=spawn_env_allowlist,
-            bind_host_proc=bind_host_proc,
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
             git_ssh_socket_path=git_ssh_socket_path,
@@ -453,6 +454,10 @@ class SandboxBackend(ABC):
         """
         del policy, cwd, chdir, target
         return argv
+
+    def prepare_launcher_policy(self, policy: SandboxPolicy) -> SandboxPolicy:
+        """Resolve host-local policy immediately before launcher construction."""
+        return policy
 
     def post_spawn(self, policy: SandboxPolicy, pid: int) -> ContainmentHandle | None:
         """
@@ -1113,8 +1118,16 @@ def run_launcher(
     # broker dirs before bwrap scans dotfiles and hides their sockets.
     sandbox = _restore_broker_socket_roots(SandboxPolicy.from_jsonable(decoded))
 
-    # Before any wrap / exec so neither the re-exec'd launcher nor the
-    # target can see env vars the spawner didn't deliberately pass.
+    backend: SandboxBackend | None = None
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+        backend = get_backend(sandbox.backend_type)
+        sandbox = backend.prepare_launcher_policy(sandbox)
+
+    # The host marker is launcher-only and must never reach the target.
+    os.environ.pop(HOST_SANDBOX_BACKEND_ENV, None)
+
+    # Before any wrap / exec so neither the re-exec'd launcher nor the target
+    # can see env vars the spawner didn't deliberately pass.
     _prune_environ_to_spawn_allowlist(sandbox)
 
     # Spawn-time wrap re-exec for backends whose sandbox enforcement
@@ -1139,7 +1152,7 @@ def run_launcher(
         and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
         and os.environ.get(_LAUNCHER_WRAPPED_ENV) != "1"
     ):
-        backend = get_backend(sandbox.backend_type)
+        assert backend is not None
         # Mint the private scratch tmpdir HERE, on the host, before the
         # wrap is built — the reference pattern from
         # ``_HelperProcessClient._start_locked``. The wrap bakes the

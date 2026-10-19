@@ -43,7 +43,6 @@ from omnigent.inner.bwrap_sandbox import (
     _ALLOWED_SOCKET_FAMILIES,
     _CLONE_NEW_FLAG_BITS,
     _DEFAULT_CWD_ALLOW_HIDDEN,
-    _HOST_SANDBOX_BACKEND_ENV,
     _PROC_BIND_HOST_BACKENDS,
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
@@ -51,7 +50,11 @@ from omnigent.inner.bwrap_sandbox import (
     _should_bind_host_proc,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
+from omnigent.inner.sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
+    SandboxPolicy,
+    with_denied_unix_sockets,
+)
 
 BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 
@@ -1057,7 +1060,7 @@ def _clear_host_backend_signals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     path that does not exist, isolating the test from the machine it runs
     on — which must not be assumed to be (or not to be) a lakebox microVM.
     """
-    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.delenv(HOST_SANDBOX_BACKEND_ENV, raising=False)
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", tmp_path / "no-such-marker")
 
 
@@ -1074,7 +1077,7 @@ def test_detect_host_backend_none_without_signals(
     assert _should_bind_host_proc() is False
 
 
-@pytest.mark.parametrize("declared", ["  LakeBox  ", "KUBERNETES"])
+@pytest.mark.parametrize("declared", ["  LakeBox  ", "PHOENIX-KUBERNETES"])
 def test_detect_host_backend_env_declaration_is_normalised_and_vetted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, declared: str
 ) -> None:
@@ -1084,7 +1087,7 @@ def test_detect_host_backend_env_declaration_is_normalised_and_vetted(
     allow-list.
     """
     _clear_host_backend_signals(monkeypatch, tmp_path)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, declared)
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, declared)
     assert _detect_host_sandbox_backend() == declared.strip().lower()
     assert _should_bind_host_proc() is True
 
@@ -1100,7 +1103,7 @@ def test_detect_host_backend_env_non_lakebox_keeps_fresh_proc(
     marker = tmp_path / "run-lakebox"
     marker.mkdir()
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "modal")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "modal")
     assert _detect_host_sandbox_backend() == "modal"
     assert "modal" not in _PROC_BIND_HOST_BACKENDS
     assert _should_bind_host_proc() is False
@@ -1114,7 +1117,7 @@ def test_detect_host_backend_marker_autodetects_lakebox(
     """
     marker = tmp_path / "run-lakebox"
     marker.mkdir()
-    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.delenv(HOST_SANDBOX_BACKEND_ENV, raising=False)
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
     assert _detect_host_sandbox_backend() == "lakebox"
     assert _should_bind_host_proc() is True

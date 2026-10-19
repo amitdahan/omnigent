@@ -18,6 +18,7 @@ from unittest import mock
 import pytest
 
 from omnigent.inner.sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
     SandboxPolicy,
     create_exec_launcher,
     run_launcher,
@@ -485,9 +486,12 @@ def test_run_launcher_keeps_resolved_proc_bind_after_env_pruning(
     from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-    monkeypatch.setenv("OMNIGENT_HOST_SANDBOX_BACKEND", "kubernetes")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
     monkeypatch.setattr(
         "omnigent.inner.bwrap_sandbox.shutil.which", lambda _name: "/usr/bin/bwrap"
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.bwrap_sandbox._LAKEBOX_MARKER", tmp_path / "no-lakebox-marker"
     )
     policy = BwrapSandboxBackend().resolve(
         OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
@@ -510,7 +514,7 @@ def test_run_launcher_keeps_resolved_proc_bind_after_env_pruning(
     with mock.patch.dict(os.environ):
         with pytest.raises(SystemExit):
             run_launcher(encoded, sys.executable, ["-c", "pass"], cwd=str(tmp_path))
-        assert "OMNIGENT_HOST_SANDBOX_BACKEND" not in os.environ
+        assert HOST_SANDBOX_BACKEND_ENV not in os.environ
     assert any(
         captured[index : index + 3] == ["--bind", "/proc", "/proc"]
         for index in range(len(captured) - 2)
@@ -533,7 +537,11 @@ def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
             capture_output=True,
             text=True,
             timeout=30,
-            env={**os.environ, "DELIBERATE_EXTRA": "kept"},
+            env={
+                **os.environ,
+                "DELIBERATE_EXTRA": "kept",
+                HOST_SANDBOX_BACKEND_ENV: "phoenix-kubernetes",
+            },
         )
     finally:
         with contextlib.suppress(OSError):
@@ -543,6 +551,7 @@ def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
     child_env = json.loads(out_file.read_text())
     # Opt-in contract: no allowlist, no prune.
     assert child_env.get("DELIBERATE_EXTRA") == "kept"
+    assert HOST_SANDBOX_BACKEND_ENV not in child_env
 
 
 def _read_launcher(target: str) -> tuple[str, str]:
