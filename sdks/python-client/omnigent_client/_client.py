@@ -106,7 +106,9 @@ class OmnigentClient:
         flows. ``None`` (default) relies on static ``headers``.
     :param timeout: Default timeout for non-streaming HTTP requests in
         seconds. SSE streams use a 600-second read timeout so server-side
-        tool execution can pause the stream for several minutes.
+        tool execution can pause the stream for several minutes. Session
+        creation with ``host_id`` allows at least 3660 seconds for the
+        server's host-launch acknowledgement.
 
     The client follows 3xx redirects on the configured origin (including
     http→https upgrades on the same host) and refuses cross-origin hops

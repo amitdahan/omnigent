@@ -35,7 +35,7 @@ from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
-from ._timeouts import _SSE_TIMEOUT
+from ._timeouts import _HOST_LAUNCH_READ_TIMEOUT_S, _SSE_TIMEOUT
 from ._types import PaginatedList
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
@@ -495,10 +495,12 @@ class SessionsNamespace:
             the session, e.g. ``"/Users/corey/projects/myapp"``.
         :param host_id: Optional connected host to launch the session's
             runner on, e.g. ``"a1b2c3d4e5f67890abcdef1234567890"``. The
-            server launches and binds that runner itself.
+            server launches and binds that runner itself. The request's
+            read timeout is at least 3660 seconds to cover the server's
+            launch budget; longer or unlimited client timeouts are retained.
         :returns: The newly created :class:`Session` snapshot.
-        :raises OmnigentError: If the server returns a non-2xx
-            status.
+        :raises OmnigentError: If the server returns a non-2xx status,
+            or a host-targeted create times out before its outcome is known.
         """
         body: dict[str, Any] = {"agent_id": agent_id}
         if title is not None:
@@ -511,7 +513,19 @@ class SessionsNamespace:
             body["workspace"] = workspace
         if host_id is not None:
             body["host_id"] = host_id
-        resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
+        timeout = httpx.Timeout(self._http.timeout)
+        if host_id is not None and timeout.read is not None:
+            timeout.read = max(timeout.read, _HOST_LAUNCH_READ_TIMEOUT_S)
+        try:
+            resp = await self._http.post(f"{self._base}/v1/sessions", json=body, timeout=timeout)
+        except httpx.TimeoutException as exc:
+            if host_id is None:
+                raise
+            raise OmnigentError(
+                f"Timed out waiting for runner launch on host {host_id!r} "
+                "(POST /v1/sessions). The launch may still complete on the server; "
+                "check the host's runners before retrying."
+            ) from exc
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
         return Session.from_dict(created)

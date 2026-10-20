@@ -31,6 +31,7 @@ What each test claims to prove (and what failure indicates):
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Iterable
 from typing import Any, Literal
@@ -43,6 +44,7 @@ from omnigent_client._sessions import (
     SessionsNamespace,
 )
 
+from omnigent.server.routes._host_launch import _MAX_LAUNCH_TIMEOUT_S
 from omnigent.server.schemas import (
     CompletedEvent,
     OutputTextDeltaEvent,
@@ -1474,37 +1476,81 @@ async def test_list_preserves_host_id_on_rows() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_from_agent_id_sends_host_id_when_given() -> None:
+@pytest.mark.parametrize("host_id", [None, "host_1"])
+@pytest.mark.parametrize("read_timeout", [0.05, 7200.0, None])
+async def test_create_from_agent_id_preserves_request_timeouts(
+    host_id: str | None, read_timeout: float | None
+) -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content.decode())
+        captured["timeout"] = request.extensions["timeout"]
         return httpx.Response(200, json=_session_response_body(status="idle"))
 
     ns, client = _make_namespace(handler)
+    client.timeout = httpx.Timeout(connect=2, read=read_timeout, write=3, pool=4)
     try:
-        await ns.create_from_agent_id("ag_abc", workspace="/w", host_id="host_1")
+        await ns.create_from_agent_id("ag_abc", workspace="/w", host_id=host_id)
     finally:
         await client.aclose()
 
-    assert captured["body"] == {"agent_id": "ag_abc", "workspace": "/w", "host_id": "host_1"}
+    expected_body: dict[str, object] = {"agent_id": "ag_abc", "workspace": "/w"}
+    if host_id is not None:
+        expected_body["host_id"] = host_id
+    assert captured["body"] == expected_body
+    timeout = captured["timeout"]
+    assert {key: timeout[key] for key in ("connect", "write", "pool")} == {
+        "connect": 2,
+        "write": 3,
+        "pool": 4,
+    }
+    if host_id is not None and read_timeout is not None:
+        assert timeout["read"] > _MAX_LAUNCH_TIMEOUT_S
+        assert timeout["read"] >= read_timeout
+    else:
+        assert timeout["read"] == read_timeout
+    assert client.timeout.read == read_timeout
 
 
 @pytest.mark.asyncio
-async def test_create_from_agent_id_omits_host_id_by_default() -> None:
-    captured: dict[str, Any] = {}
+async def test_host_launch_waits_past_the_ordinary_http_read_timeout() -> None:
+    """A real HTTP read waits for a delayed launch without extending ordinary requests."""
+    pending: set[asyncio.Task[None]] = set()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content.decode())
-        return httpx.Response(200, json=_session_response_body(status="idle"))
+    async def respond(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            await asyncio.sleep(0.2)
+            body = json.dumps(_session_response_body(status="idle")).encode()
+            writer.write(
+                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
-    ns, client = _make_namespace(handler)
+    def connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.create_task(respond(reader, writer))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    server = await asyncio.start_server(connected, "127.0.0.1", 0)
+    base_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
     try:
-        await ns.create_from_agent_id("ag_abc")
+        async with server, httpx.AsyncClient(timeout=0.05, trust_env=False) as http:
+            sessions = SessionsNamespace(http, base_url)
+            launched = await sessions.create_from_agent_id("ag_abc", host_id="host_1")
+            assert launched.id == "conv_abc"
+            with pytest.raises(httpx.ReadTimeout):
+                await sessions.create_from_agent_id("ag_abc")
     finally:
-        await client.aclose()
-
-    assert "host_id" not in captured["body"]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _host(

@@ -5677,6 +5677,49 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
     ]
 
 
+@pytest.mark.parametrize("failure", [httpx.ReadTimeout, httpx.ConnectTimeout])
+def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: type[httpx.TimeoutException],
+) -> None:
+    """An uncertain launch reports its host without leaking transport details or retrying."""
+    _local_host(monkeypatch, "host_local")
+    monkeypatch.setattr(chat_module, "_server_headers", lambda **_kwargs: {})
+    monkeypatch.setattr(chat_module, "_server_auth", lambda **_kwargs: None)
+    requests: list[str] = []
+
+    async def handler(_transport: object, request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/v1/runners":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/hosts":
+            return httpx.Response(
+                200, json={"hosts": [{"host_id": "host_local", "status": "online"}]}
+            )
+        assert request.url.path == "/v1/sessions"
+        raise failure("private transport details", request=request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    with pytest.raises(SystemExit) as excinfo:
+        chat_module._run_headless_prompt(
+            "http://srv",
+            "scribe",
+            None,
+            prompt="hi",
+            registered_agent=RegisteredAgent(id="ag_s", harness=None),
+        )
+
+    assert excinfo.value.code == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "Error: Timed out waiting for runner launch on host 'host_local'" in output.err
+    assert "POST /v1/sessions" in output.err
+    assert "may still complete" in output.err and "before retrying" in output.err
+    assert "private transport details" not in output.err and "Traceback" not in output.err
+    assert requests == ["GET /v1/runners", "GET /v1/hosts", "POST /v1/sessions"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status_code", "expected_error"),

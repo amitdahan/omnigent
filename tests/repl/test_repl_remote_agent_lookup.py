@@ -158,6 +158,7 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             created.append(json.loads(request.content))
             if created[-1].get("host_id"):
                 assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_local"
+                assert request.extensions["timeout"]["read"] > 3600
             return httpx.Response(201, json=snapshot)
         if path == "/v1/sessions/conv_remote" and request.method == "GET":
             if scenario != "resume":

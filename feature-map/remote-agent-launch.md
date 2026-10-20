@@ -91,6 +91,13 @@ coverage requires `pexpect`; a skipped variant is not proof.
   valid survivor; missing optional harness metadata remains supported.
   Host-listing failures name `GET /v1/hosts` and the HTTP status rather than
   advising users to start a host. Only a 404 retains the older-server fallback.
+  Host-targeted creation waits beyond the server's maximum launch budget;
+  ordinary requests keep their timeout. A remaining create-time timeout names
+  the host and warns that launch may still complete before suggesting a retry.
+  `tests/frontends/sdk/test_sessions_namespace.py::test_host_launch_waits_past_the_ordinary_http_read_timeout`
+  covers a delayed loopback HTTP reply; it is not a real host-process delay.
+  `tests/cli/test_chat.py::test_one_shot_host_launch_timeout_is_a_clean_cli_error`
+  checks the headless error boundary with injected transport timeouts.
 
 Run component coverage without browser flags:
 
