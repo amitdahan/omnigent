@@ -524,11 +524,13 @@ function listKeys<T>(items: readonly T[], identity: (item: T) => readonly unknow
   });
 }
 
+const CHECK_ROW_CLASS = "flex items-center gap-2 px-1.5 py-1.5";
+
 /**
  * A CI-status pill (e.g. "✓ 66 passed"); hovering it reveals the individual job
  * names in that bucket, each with the status icon and a divider between rows.
- * Renders nothing when the bucket is empty. The full list shows — the card is
- * height-capped and scrolls.
+ * A job with a known run URL links to it. Renders nothing when the bucket is
+ * empty. The full list shows — the card is height-capped and scrolls.
  */
 function CheckPill({
   label,
@@ -571,14 +573,32 @@ function CheckPill({
           <p className="px-1.5 py-1 text-muted-foreground">No job details.</p>
         ) : (
           <ul className="divide-y divide-border">
-            {names.map((r, i) => (
-              <li key={keys[i]} className="flex items-center gap-2 px-1.5 py-1.5">
-                <span className="shrink-0">{icon}</span>
-                <span className="truncate" title={r.name}>
-                  {r.name}
-                </span>
-              </li>
-            ))}
+            {names.map((r, i) => {
+              const row = (
+                <>
+                  <span className="shrink-0">{icon}</span>
+                  <span className="truncate" title={r.name}>
+                    {r.name}
+                  </span>
+                </>
+              );
+              return (
+                <li key={keys[i]}>
+                  {r.url ? (
+                    <a
+                      href={r.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={cn(CHECK_ROW_CLASS, "rounded-sm hover:bg-muted/60")}
+                    >
+                      {row}
+                    </a>
+                  ) : (
+                    <div className={CHECK_ROW_CLASS}>{row}</div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
       </HoverCardContent>

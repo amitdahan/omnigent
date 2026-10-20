@@ -1301,7 +1301,7 @@ describe("PullRequestPanel", () => {
         expect(keyWarnings()).toEqual([]);
       });
 
-      it("lists every check in the hover card when checks share a build URL or a name", async () => {
+      it("lists and links every check in the hover card when checks share a build URL or a name", async () => {
         const user = userEvent.setup();
         const keyWarnings = watchKeyWarnings();
         const buildUrl = "https://forge.example.test/contoso/web/_build/results?buildId=41";
@@ -1324,6 +1324,10 @@ describe("PullRequestPanel", () => {
         await user.hover(screen.getByRole("button", { name: /4\s*passed/ }));
         const rows = await screen.findAllByRole("listitem");
         expect(rows.map((row) => row.textContent)).toEqual(["Build", "Lint", "Deploy", "Deploy"]);
+        expect(
+          rows.map((row) => within(row).queryByRole("link")?.getAttribute("href") ?? null),
+        ).toEqual([buildUrl, buildUrl, null, null]);
+        expect(within(rows[0]).getByRole("link")).toHaveAttribute("target", "_blank");
         expect(keyWarnings()).toEqual([]);
       });
     });
