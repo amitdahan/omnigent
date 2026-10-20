@@ -1748,6 +1748,7 @@ describe("session PR selection", () => {
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveTextContent(/^$/);
     expect(screen.queryByRole("link", { name: "Open the PR on GitHub" })).toBeNull();
 
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };

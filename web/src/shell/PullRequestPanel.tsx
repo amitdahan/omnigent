@@ -1049,30 +1049,26 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
   const queryClient = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all(
+        ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
+          queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
+        ),
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  };
+  const refreshIcon = (
+    <RefreshCwIcon className={cn("size-3.5", refreshing && "animate-spin")} aria-hidden="true" />
+  );
   const refreshButton = (
-    <TooltipProvider delayDuration={0}>
-      <IconButton
-        label="Refresh"
-        disabled={refreshing}
-        onClick={async () => {
-          setRefreshing(true);
-          try {
-            await Promise.all(
-              ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
-                queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
-              ),
-            );
-          } finally {
-            setRefreshing(false);
-          }
-        }}
-      >
-        <RefreshCwIcon
-          className={cn("size-3.5", refreshing && "animate-spin")}
-          aria-hidden="true"
-        />
-      </IconButton>
-    </TooltipProvider>
+    <Button size="sm" variant="ghost" disabled={refreshing} onClick={refresh}>
+      {refreshIcon}
+      Refresh
+    </Button>
   );
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
@@ -1255,8 +1251,10 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
               </TooltipProvider>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1">
-              {refreshButton}
               <TooltipProvider delayDuration={0}>
+                <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
+                  {refreshIcon}
+                </IconButton>
                 <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
                   <PlusIcon className="size-3.5" aria-hidden="true" />
                 </IconButton>
