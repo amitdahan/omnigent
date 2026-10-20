@@ -843,110 +843,13 @@ async def test_fork_subagent_inheriting_its_own_spawn_record_registers(
     assert state.subagents["a-fork"].parent_subagent_id is None
 
 
-def _process_read_bytes() -> int | None:
-    """Bytes this process has read so far, from Linux ``/proc`` accounting."""
-    try:
-        text = Path("/proc/self/io").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in text.splitlines():
-        if line.startswith("rchar:"):
-            return int(line.partition(":")[2])
-    return None
-
-
-async def test_unresolved_meta_does_not_rescan_unchanged_transcripts_every_poll(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A meta whose spawn never resolves must not make every poll re-read all transcripts.
-
-    Correlation reads the root transcript and each ``agent-*.jsonl`` in full. While
-    one ``.meta.json`` stays unregistered, an idle session repeated that full read
-    on every poll, so runner CPU and read volume grew with files that had not
-    changed since the previous poll.
-    """
-    bridge_dir = tmp_path / "bridge"
-    transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text("", encoding="utf-8")
-    helper_path = _seed_subagent_on_disk(
-        transcript_path=transcript_path,
-        subagent_id="a-finished",
-        agent_type="general-purpose",
-        description="finished helper",
-        tool_use_id="toolu_finished",
-    )
-    filler = json.dumps({"type": "file-history-snapshot", "snapshot": {"content": "x" * 4096}})
-    for path in (transcript_path, helper_path):
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write((filler + "\n") * 256)
-    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
-    (subagents_dir / "agent-a-unresolved.meta.json").write_text(
-        json.dumps(
-            {
-                "agentType": "general-purpose",
-                "description": "spawn record never written",
-                "toolUseId": "toolu_never_resolved",
-            }
-        ),
-        encoding="utf-8",
-    )
-    transcript_bytes = transcript_path.stat().st_size + helper_path.stat().st_size
-
-    def response_for(item: dict[str, Any]) -> dict[str, Any]:
-        if item.get("type") == "external_subagent_start":
-            return {"queued": False, "child_session_id": "conv_finished"}
-        return {"item_id": "ack"}
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_batch_safe_handler(response_for)),
-        base_url="http://ap",
-    ) as client:
-        poll_kwargs: dict[str, Any] = {
-            "client": client,
-            "parent_session_id": "conv_root",
-            "bridge_dir": bridge_dir,
-            "transcript_path": transcript_path,
-            "agent_name": "claude-native-ui",
-            "start_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
-            "item_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
-            "status_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
-        }
-        state = await forwarder._forward_available_subagents(
-            state=forwarder.SubagentForwardState(subagents={}), **poll_kwargs
-        )
-        assert state.subagents["a-finished"].child_conversation_id == "conv_finished"
-        assert "a-unresolved" not in state.subagents
-
-        scans = _count_transcript_scans(monkeypatch)
-        read_before = _process_read_bytes()
-        state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
-        read_after = _process_read_bytes()
-
-    assert "a-unresolved" not in state.subagents
-    assert scans == [], "an idle poll re-scanned unchanged transcripts"
-    # Linux /proc accounting measures the reported quantity (bytes read) directly;
-    # elsewhere the scan count above is the whole check.
-    if read_before is not None and read_after is not None:
-        reread_bytes = read_after - read_before
-        assert reread_bytes < transcript_bytes // 4, (
-            f"an idle poll with unchanged files read {reread_bytes} bytes "
-            f"(transcripts total {transcript_bytes} bytes)"
-        )
-
-
 @pytest.mark.parametrize("spawn_owner", ["root", "helper"])
 async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     spawn_owner: str,
 ) -> None:
-    """A spawn record appended after idle polls still resolves its waiting meta.
-
-    Idle polls skip transcripts that have not changed since the previous scan, so
-    the poll after the record lands must re-read the grown file, whether that is
-    the root transcript or a helper's sidechain transcript, and register the
-    sub-agent under the owner that issued the spawn.
-    """
+    """Idle polls reuse unchanged transcripts; a later root or helper spawn registers."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -988,11 +891,17 @@ async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
             "item_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
             "status_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
         }
+        scans = _count_transcript_scans(monkeypatch)
         state = await forwarder._forward_available_subagents(
             state=forwarder.SubagentForwardState(subagents={}), **poll_kwargs
         )
-        state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
-        assert set(state.subagents) == {"a-finished"}
+        assert state.subagents["a-finished"].child_conversation_id == "conv_a-finished"
+        assert scans == [transcript_path, helper_path]
+        scans.clear()
+        for _ in range(3):
+            state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
+            assert set(state.subagents) == {"a-finished"}
+        assert scans == [], "idle polls re-scanned unchanged transcripts"
 
         spawn_path = transcript_path if spawn_owner == "root" else helper_path
         with spawn_path.open("a", encoding="utf-8") as handle:
@@ -1002,6 +911,7 @@ async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
             handle.write(json.dumps(record) + "\n")
         state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
 
+    assert scans == [spawn_path], "only the changed transcript should be re-scanned"
     late = state.subagents["a-late"]
     assert late.child_conversation_id == "conv_a-late"
     assert late.parent_subagent_id == (None if spawn_owner == "root" else "a-finished")

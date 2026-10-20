@@ -2560,14 +2560,7 @@ def _tool_use_ids_in_transcript(
 
 @dataclass(frozen=True)
 class _TranscriptSpawnIdCacheEntry:
-    """
-    Spawn tool-use ids scanned from one transcript at a given size and mtime.
-
-    :param size: File size in bytes when the ids were scanned.
-    :param mtime_ns: File modification time in nanoseconds at that scan.
-    :param include_sidechains: The ``include_sidechains`` the scan used.
-    :param tool_use_ids: Spawn tool-use ids the transcript owned at that scan.
-    """
+    """Spawn tool-use IDs cached for a transcript's size, mtime and sidechain mode."""
 
     size: int
     mtime_ns: int
