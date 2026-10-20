@@ -84,6 +84,8 @@ async def test_remote_repl_preserves_selected_catalog_identity() -> None:
         ("local-host", "missing-entry", "unconfigured"),
         ("other-host", True, "other machines"),
         ("no-host", True, "no online runner"),
+        ("host-listing-unsupported", True, "no online runner"),
+        ("host-listing-failed", True, "GET /v1/hosts failed.*HTTP 500"),
         ("resume", True, None),
     ],
 )
@@ -139,6 +141,9 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             return httpx.Response(200, json={"data": runners})
         if path == "/v1/hosts":
             assert scenario not in {"online-runner", "resume"}
+            if scenario.startswith("host-listing-"):
+                status_code = 404 if scenario == "host-listing-unsupported" else 500
+                return httpx.Response(status_code, json={"detail": "lookup failed"})
             harnesses = (
                 {"codex": True} if readiness == "missing-entry" else {"claude-sdk": readiness}
             )

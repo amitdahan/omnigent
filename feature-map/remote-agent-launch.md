@@ -85,6 +85,8 @@ coverage requires `pexpect`; a skipped variant is not proof.
   Mocked HTTP errors do not verify real authentication or access control.
   Mixed valid/malformed catalog rows must fail instead of auto-selecting the
   valid survivor; missing optional harness metadata remains supported.
+  Host-listing failures name `GET /v1/hosts` and the HTTP status rather than
+  advising users to start a host. Only a 404 retains the older-server fallback.
 
 Run component coverage without browser flags:
 

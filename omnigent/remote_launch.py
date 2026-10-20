@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from omnigent_client import OmnigentError
+
 from omnigent.cli_auth import databricks_request_headers
 from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
@@ -21,7 +23,7 @@ def pin_remote_launch_host(sessions: SessionsNamespace, host_id: str) -> None:
 
 
 class LaunchHostError(RuntimeError):
-    """No runner is online and no connected host can launch one here; ``str()`` says why."""
+    """Host discovery or launch selection failed; ``str()`` explains why."""
 
 
 class RemoteLaunchHostError(LaunchHostError):
@@ -57,13 +59,13 @@ async def resolve_remote_launch_host(
     Return this machine's host id if the server can launch a runner on it.
 
     Only this machine qualifies: the session's workspace is this process's cwd,
-    which another machine's host can't open. ``None`` when no host is connected.
+    which another machine's host can't open. ``None`` when no host is connected
+    or an older server does not expose the hosts route.
 
+    :raises LaunchHostError: If host discovery fails on a supported route.
     :raises LocalHostCannotLaunchError: If this machine's host can't run *harness*.
     :raises RemoteLaunchHostError: If only other machines' hosts could.
     """
-    from omnigent_client import OmnigentError
-
     from omnigent.harness_aliases import canonicalize_harness
     from omnigent.host import identity
 
@@ -72,9 +74,15 @@ async def resolve_remote_launch_host(
             harness=harness,
             canonicalize=lambda name: canonicalize_harness(name) or name,
         )
-    except OmnigentError:
-        logger.debug("could not list launch hosts", exc_info=True)
-        return None
+    except OmnigentError as exc:
+        if exc.status_code == 404:
+            logger.debug("server does not expose launch hosts", exc_info=True)
+            return None
+        status = f" (HTTP {exc.status_code})" if exc.status_code is not None else ""
+        raise LaunchHostError(
+            f"Could not list connected hosts: GET /v1/hosts failed{status}. "
+            "Check the server and your access, then retry."
+        ) from exc
     local = identity.load_host_identity_if_present()
     mine = next((h for h in hosts if local is not None and h.host_id == local.host_id), None)
     if mine is not None:

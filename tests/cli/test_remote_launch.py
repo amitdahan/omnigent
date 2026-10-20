@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import httpx
 import pytest
-from omnigent_client import LaunchHost
+from omnigent_client import LaunchHost, OmnigentError, SessionsNamespace
 
 import omnigent.host.identity as identity
 from omnigent.remote_launch import (
@@ -116,15 +117,51 @@ def test_host_names_are_escaped_in_the_message(monkeypatch: pytest.MonkeyPatch) 
     assert "\\x1b" in str(excinfo.value)
 
 
-def test_host_listing_error_is_treated_as_no_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failing ``GET /v1/hosts`` falls back to the plain "no online runner" error."""
-    from omnigent_client import OmnigentError
+@pytest.mark.asyncio
+async def test_unsupported_host_listing_route_falls_back_to_no_host() -> None:
+    """An older server without the hosts route retains the no-host fallback."""
 
-    _local_host(monkeypatch, "host_local")
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/hosts"
+        return httpx.Response(404, json={"detail": "Not Found"})
 
-    async def _broken(**_kwargs: object) -> list[LaunchHost]:
-        raise OmnigentError("forbidden")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        assert (
+            await resolve_remote_launch_host(
+                SessionsNamespace(http, "http://srv"), harness="claude-sdk"
+            )
+            is None
+        )
 
-    sessions = SimpleNamespace(list_launch_hosts=_broken)
 
-    assert asyncio.run(resolve_remote_launch_host(sessions, harness="claude-sdk")) is None  # type: ignore[arg-type]
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403, 429, 500, 503])
+async def test_host_listing_failure_reports_route_and_http_status(status_code: int) -> None:
+    """SDK HTTP failures must not become advice to connect an absent host."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/hosts"
+        return httpx.Response(status_code, json={"detail": "lookup failed"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(LaunchHostError) as excinfo:
+            await resolve_remote_launch_host(SessionsNamespace(http, "http://srv"), harness=None)
+
+    message = str(excinfo.value)
+    assert "GET /v1/hosts" in message
+    assert f"HTTP {status_code}" in message
+    assert "host --server" not in message
+    assert isinstance(excinfo.value.__cause__, OmnigentError)
+
+
+def test_host_listing_failure_without_http_status_remains_an_error() -> None:
+    """An unclassified SDK error is not evidence of an empty host list."""
+
+    async def broken(**_kwargs: object) -> list[LaunchHost]:
+        raise OmnigentError("lookup failed")
+
+    sessions = SimpleNamespace(list_launch_hosts=broken)
+    with pytest.raises(LaunchHostError, match="GET /v1/hosts failed"):
+        asyncio.run(
+            resolve_remote_launch_host(sessions, harness=None)  # type: ignore[arg-type]
+        )
