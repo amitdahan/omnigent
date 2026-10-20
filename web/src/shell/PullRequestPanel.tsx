@@ -589,7 +589,7 @@ function CheckPill({
                       href={r.url}
                       target="_blank"
                       rel="noreferrer"
-                      className={cn(CHECK_ROW_CLASS, "rounded-sm hover:bg-muted/60")}
+                      className={cn(CHECK_ROW_CLASS, "cursor-pointer hover:underline")}
                     >
                       {row}
                     </a>
