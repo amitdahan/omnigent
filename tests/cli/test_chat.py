@@ -2320,14 +2320,17 @@ def test_chat_with_server_interactive_resume_without_session_agent_offers_the_me
     assert picked["interactive"] is True
 
 
-def test_pick_agent_menu_accepts_a_typed_name(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("answer", ["scribe", "2"], ids=["name", "index"])
+def test_pick_agent_menu_accepts_a_name_or_index(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], answer: str
 ) -> None:
-    """The interactive menu over the registered agents accepts an agent typed by name."""
+    """The catalog menu accepts a name or index and preserves the selected identity."""
     _serve_listings(monkeypatch, agent_pages=[_agents_page(["coder", "scribe"])])
-    monkeypatch.setattr("sys.stdin", io.StringIO("scribe\n"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{answer}\n"))
 
-    assert _pick_agent("http://127.0.0.1:6767").id == "ag_scribe"
+    picked = _pick_agent("http://127.0.0.1:6767")
+    assert picked.id == "ag_scribe"
+    assert picked.name == "scribe"
 
     out = capsys.readouterr().out
     assert "Available agents" in out and "2. scribe" in out

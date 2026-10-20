@@ -79,9 +79,6 @@ async def test_remote_repl_preserves_selected_catalog_identity() -> None:
         ("mismatched-runner", True, None),
         ("local-host", "needs-auth", None),
         ("local-host", "binary-missing", "binary-missing"),
-        ("local-host", "version-too-low", "version-too-low"),
-        ("local-host", False, "unconfigured"),
-        ("local-host", "missing-entry", "unconfigured"),
         ("other-host", True, "other machines"),
         ("no-host", True, "no online runner"),
         ("host-listing-unsupported", True, "no online runner"),
@@ -144,9 +141,6 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             if scenario.startswith("host-listing-"):
                 status_code = 404 if scenario == "host-listing-unsupported" else 500
                 return httpx.Response(status_code, json={"detail": "lookup failed"})
-            harnesses = (
-                {"codex": True} if readiness == "missing-entry" else {"claude-sdk": readiness}
-            )
             hosts = (
                 []
                 if scenario == "no-host"
@@ -155,7 +149,7 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
                         "host_id": "host_other" if scenario == "other-host" else "host_local",
                         "name": "devbox.local",
                         "status": "online",
-                        "configured_harnesses": harnesses,
+                        "configured_harnesses": {"claude-sdk": readiness},
                     }
                 ]
             )

@@ -54,8 +54,8 @@ coverage requires `pexpect`; a skipped variant is not proof.
   uploads a differing same-name bundle and verifies the registered reply
   without another name lookup; it does not drive the terminal UI.
 - Interactive selection:
-  `tests/e2e/test_chat_e2e.py::test_chat_remote_pick_agent` checks the picker
-  against a real server with the prompt stubbed, not a full terminal journey.
+  `tests/cli/test_chat.py::test_pick_agent_menu_accepts_a_name_or_index`
+  checks menu selection by name and index with a mocked catalog.
   For terminal proof, register A and B on an isolated server, run A once, then
   run the interactive CLI, choose unused B by name, and send `hi`. Capture the
   menu, B's scripted reply, exit status, and its catalog ID from the session.
@@ -103,7 +103,7 @@ Run the own-environment process scenarios with the default mock model:
 ```sh
 uv run --no-sync pytest -q \
   tests/e2e/test_remote_url_chat_fresh_session_2437.py \
-  tests/e2e/test_chat_e2e.py::test_chat_remote_pick_agent --reruns 0
+  --reruns 0
 ```
 
 For terminal evidence, record the command, transcript or timed terminal video,

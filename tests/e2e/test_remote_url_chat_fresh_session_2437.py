@@ -32,7 +32,6 @@ import asyncio
 import os
 import subprocess
 import sys
-import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -47,6 +46,7 @@ from tests._helpers.live_server import (
     isolated_local_server,
     isolated_process_env,
 )
+from tests._helpers.polling import poll_until
 from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -643,15 +643,6 @@ def test_run_one_shot_without_online_runner_fails_cleanly(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _wait_until(predicate: object, *, timeout: float, what: str) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():  # type: ignore[operator]
-            return
-        time.sleep(0.5)
-    raise AssertionError(f"timed out waiting for {what}")
-
-
 @pytest.mark.parametrize("interactive", [False, True], ids=["one-shot", "interactive"])
 def test_run_launches_a_runner_on_this_machines_host(
     mock_llm_server_url: str | None,
@@ -732,15 +723,14 @@ def test_run_launches_a_runner_on_this_machines_host(
                             child.expect(r"Ctrl.C exit")
                             child.send("hi\r")
                             child.expect(marker)
-                            _wait_until(
+                            poll_until(
                                 lambda: any(
                                     session.get("status") == "idle"
                                     for session in client.get(
                                         "/v1/sessions", params={"visibility": "all"}
                                     ).json()["data"]
                                 ),
-                                timeout=30.0,
-                                what="interactive turn to finish",
+                                timeout_s=30.0,
                             )
                             child.sendcontrol("d")
                             child.expect(pexpect.EOF)
@@ -783,10 +773,9 @@ def test_run_launches_a_runner_on_this_machines_host(
                     )
                     response.raise_for_status()
                 # The one-shot or the test stops only its own launched runner.
-                _wait_until(
+                poll_until(
                     lambda: (
                         not any(r.get("online") for r in client.get("/v1/runners").json()["data"])
                     ),
-                    timeout=60.0,
-                    what="the launched runner to stop",
+                    timeout_s=60.0,
                 )
