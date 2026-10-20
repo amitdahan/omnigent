@@ -6999,7 +6999,7 @@ export function committedItemProvesDelivery(
  * @param replyDraft - Outgoing reply metadata.
  * @returns `true` when nothing differs, or when no draft is tracked for the id.
  */
-function restoredSendDraftUnchanged(
+export function restoredSendDraftUnchanged(
   restored: ConversationState["restoredSendDraft"],
   stableId: string,
   text: string,
@@ -7014,6 +7014,23 @@ function restoredSendDraftUnchanged(
     outgoing.every((file) => restored.files.includes(file)) &&
     JSON.stringify(restored.replyDraft ?? null) === JSON.stringify(replyDraft ?? null)
   );
+}
+
+/** Consume a session's failed send once, retaining retry identity only when restored. */
+export function takeFailedSendDraft(conversationId: string, hasDraft: boolean) {
+  const state = setterForState(conversationId);
+  const failed = state?.failedSendDraft;
+  if (!state || !failed || failed.conversationId !== conversationId) return null;
+  const restore = !hasDraft && !committedItemProvesDelivery(state.blocks, failed);
+  setterFor(conversationId)({
+    failedSendDraft: null,
+    pendingRetryStableId: restore ? (failed.stableId ?? null) : null,
+    restoredSendDraft:
+      restore && failed.stableId
+        ? { ...failed, stableId: failed.stableId, delivered: false }
+        : null,
+  });
+  return restore ? failed : null;
 }
 
 /**

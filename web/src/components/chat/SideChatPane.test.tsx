@@ -5,6 +5,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as filesApi from "@/lib/filesApi";
+import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
 import { useChatStore, type ChatState } from "@/store/chatStore";
@@ -849,3 +851,119 @@ describe("side-chat slash commands", () => {
     expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
   });
 });
+
+it.each([false, true])(
+  "recovers grid failures without changing ordinary side chats (grid: %s)",
+  async (fullSession) => {
+    const entry = conversationRegistry.acquire(childId);
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Introduction", text: "Quoted" }],
+      text: "Retry this",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    const failed = {
+      conversationId: childId,
+      text,
+      replyDraft,
+      files: [file],
+      stableId: "retry-stable",
+    };
+    entry.setState({
+      sessionStatus: "idle",
+      abortController: new AbortController(),
+      failedSendDraft: failed,
+    });
+    useChatStore.setState({ send: initialStoreState.send });
+    renderPane(
+      <StrictMode>
+        <SideChatPane childId={childId} fullSession={fullSession} />
+      </StrictMode>,
+    );
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(fullSession ? text : "");
+    expect(entry.getState().failedSendDraft).toBe(fullSession ? null : failed);
+    if (!fullSession) return;
+    expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([file]);
+    vi.spyOn(filesApi, "uploadFile").mockResolvedValue({
+      id: "uploaded",
+      filename: file.name,
+      bytes: 5,
+      created_at: 0,
+    });
+    const post = vi.spyOn(sessionsApi, "postEvent").mockResolvedValue({ queued: true });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    await waitFor(() => expect(post).toHaveBeenCalledOnce());
+    expect(post.mock.calls[0][1]).toMatchObject({ data: { stable_id: "retry-stable" } });
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("");
+  },
+);
+
+it.each(["none", "text", "files", "quote"] as const)(
+  "retracts a delivered grid draft only while unchanged: %s",
+  (edit) => {
+    const entry = conversationRegistry.acquire(childId);
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    entry.setState({
+      failedSendDraft: {
+        conversationId: childId,
+        text: "> Quote\n\nRetry",
+        files: [file],
+        stableId: "stable",
+      },
+    });
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("> Quote\n\nRetry");
+    act(() =>
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        ...(edit === "text"
+          ? { text: "Edited" }
+          : edit === "files"
+            ? { files: [] }
+            : edit === "quote"
+              ? { quotes: ["New quote"] }
+              : {}),
+      })),
+    );
+    act(() =>
+      entry.setState({
+        restoredSendDraft: { ...entry.getState().restoredSendDraft!, delivered: true },
+      }),
+    );
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(
+      edit === "none" ? "" : edit === "text" ? "Edited" : "> Quote\n\nRetry",
+    );
+    expect(entry.getState().restoredSendDraft).toBeNull();
+  },
+);
+
+it.each([false, true])(
+  "revalidates recovered files and preserves newer quoted drafts: %s",
+  (hasNewDraft) => {
+    const entry = conversationRegistry.acquire(childId);
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    if (hasNewDraft)
+      act(() =>
+        useChatStore
+          .getState()
+          .updateSideChatComposer(childId, () => ({ text: "", files: [], quotes: ["New quote"] })),
+      );
+    act(() =>
+      entry.setState({
+        failedSendDraft: {
+          conversationId: childId,
+          text: "Retry",
+          files: [new File(["bad"], "bad.exe")],
+          stableId: "stable",
+        },
+      }),
+    );
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(hasNewDraft ? "" : "Retry");
+    expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([]);
+    expect(entry.getState().pendingRetryStableId).toBe(hasNewDraft ? null : "stable");
+    if (hasNewDraft)
+      expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("New quote");
+    else expect(toast.error).toHaveBeenCalledWith(expect.stringContaining("bad.exe"));
+  },
+);
