@@ -117,14 +117,15 @@ def test_session_grid_drag_persist_live_updates_and_close(
         grid_url = page.url
         expect(page.get_by_role("region", name="Grids")).to_be_visible()
         grid_nav = page.get_by_role("region", name="Grids")
-        grid_nav.get_by_role("link").dblclick()
+        # dnd-kit suppresses click propagation for 50 ms after a drop.
+        grid_nav.get_by_role("link").dblclick(delay=75)
         rename = page.get_by_role("textbox", name="Rename grid")
         page.get_by_role("heading", name="Grid · 2 sessions", exact=True).click()
         _move_cell(page, "grid-0", "grid-1")
         expect(grid_nav.get_by_role("link")).to_have_text("Grid session 1 + Grid session 0")
         _move_cell(page, "grid-0", "grid-1")
         expect(grid_nav.get_by_role("link")).to_have_text("Grid session 0 + Grid session 1")
-        grid_nav.get_by_role("link").dblclick()
+        grid_nav.get_by_role("link").dblclick(delay=75)
         rename.fill("Cancelled title")
         rename.press("Escape")
         expect(grid_nav.get_by_role("link")).not_to_contain_text("Cancelled title")

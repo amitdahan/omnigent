@@ -7021,15 +7021,22 @@ export function takeFailedSendDraft(conversationId: string, hasDraft: boolean) {
   const state = setterForState(conversationId);
   const failed = state?.failedSendDraft;
   if (!state || !failed || failed.conversationId !== conversationId) return null;
-  const restore = !hasDraft && !committedItemProvesDelivery(state.blocks, failed);
-  setterFor(conversationId)({
-    failedSendDraft: null,
-    pendingRetryStableId: restore ? (failed.stableId ?? null) : null,
-    restoredSendDraft:
-      restore && failed.stableId
-        ? { ...failed, stableId: failed.stableId, delivered: false }
-        : null,
-  });
+  const delivered = committedItemProvesDelivery(state.blocks, failed);
+  const restore = !hasDraft && !delivered;
+  const patch: Partial<ConversationState> = { failedSendDraft: null };
+  if (!delivered) patch.pendingRetryStableId = restore ? (failed.stableId ?? null) : null;
+  // A discarded failure must not untrack an earlier draft still in the composer.
+  if (restore && failed.stableId)
+    patch.restoredSendDraft = {
+      conversationId,
+      stableId: failed.stableId,
+      text: failed.text,
+      files: failed.files,
+      replyDraft: failed.replyDraft,
+      serverRefused: failed.serverRefused,
+      delivered: false,
+    };
+  setterFor(conversationId)(patch);
   return restore ? failed : null;
 }
 

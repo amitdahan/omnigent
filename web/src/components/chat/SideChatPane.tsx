@@ -461,10 +461,14 @@ function SideChatComposer({
     const { accepted, errors } = validateAttachments(failed.files);
     errors.forEach((message) => toast.error(message));
     updateComposer(childId, () => ({ text: failed.text, files: accepted }));
-    // This composer restores serialized quotes as text; compare retries in that same form.
+    // Track the displayed draft for delivery; filtered files require a fresh send ID.
     const entry = conversationRegistry.peek(childId)!;
     const restored = entry.getState().restoredSendDraft;
-    if (restored) entry.setState({ restoredSendDraft: { ...restored, replyDraft: undefined } });
+    if (restored)
+      entry.setState({
+        restoredSendDraft: { ...restored, files: accepted, replyDraft: undefined },
+        pendingRetryStableId: errors.length > 0 ? null : entry.getState().pendingRetryStableId,
+      });
   }, [fullSession, childId, failedSendDraft, updateComposer]);
   useEffect(() => {
     if (!fullSession || !restoredSendDraft?.delivered) return;
