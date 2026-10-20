@@ -692,26 +692,28 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
   });
 
-  it("renders exactly one '+' — after the nav tabs with no open tabs, trailing the tabs otherwise", () => {
+  it("renders exactly one '+' in the trailing controls, with or without open tabs", () => {
+    const expectTrailingPlus = () => {
+      const plus = screen.getByRole("button", { name: "Open new" });
+      expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
+      // "+" leads the right-pinned group, ahead of the picker and fullscreen toggle.
+      const trailing = plus.closest(".ml-auto")!;
+      expect(trailing.firstElementChild).toContainElement(plus);
+      expect(trailing).toContainElement(screen.getByRole("button", { name: "Full screen" }));
+      return trailing;
+    };
     declaresShell();
-    // No open tabs → single "+", sitting after the nav tabs.
     renderWorkspace({ openFiles: [] });
-    expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
+    expectTrailingPlus();
     cleanup();
 
-    // With an open file tab → still exactly one "+", now trailing the tabs. It
-    // sits OUTSIDE the scrolling tabs region (as its next sibling) so it stays
+    // With open tabs the "+" stays OUTSIDE the scrolling tabs region so it stays
     // pinned when the tabs overflow instead of scrolling/overlapping.
     declaresShell();
     renderWorkspace({ openFiles: ["src/App.tsx"] });
-    const plus = screen.getByRole("button", { name: "Open new" });
-    expect(plus).toBeInTheDocument();
-    // The scrolling tabs region (holds the file tab's close button) is the
-    // "+" wrapper's immediately-preceding sibling — the "+" is not inside it.
-    const plusWrapper = plus.parentElement!;
-    const tabsRegion = plusWrapper.previousElementSibling as HTMLElement;
+    const tabsRegion = expectTrailingPlus().previousElementSibling as HTMLElement;
     expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
-    expect(tabsRegion).not.toContainElement(plus);
+    expect(tabsRegion).not.toContainElement(screen.getByRole("button", { name: "Open new" }));
   });
 
   it.each([false, true])(
@@ -961,33 +963,30 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
   // The row containing the fixed nav tabs — the tab strip.
   const strip = () => screen.getByRole("tab", { name: /files/i }).closest("div.border-b")!;
 
-  it("keeps exactly one ml-auto in the strip with no open tabs (picker pins trailing controls right)", () => {
+  it("keeps exactly one ml-auto in the strip with no open tabs (trailing group pins right)", () => {
     // Two ml-auto siblings split the free space and strand the nav group
-    // mid-strip. With no open tabs the single ml-auto lives on the panel picker
-    // wrapper; the nav group must NOT also carry one.
+    // mid-strip. The single ml-auto lives on the trailing control group; the
+    // nav group must NOT also carry one.
     renderWorkspace({ openFiles: [], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
-    // The picker pins the trailing controls right.
     const picker = screen.getByRole("button", { name: "Select panel" });
-    expect(picker.parentElement).toHaveClass("ml-auto");
+    expect(picker.closest(".ml-auto")).not.toBeNull();
     // The nav tablist stays left — no ml-auto.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
   });
 
-  it("keeps exactly one ml-auto in the strip with open tabs (picker pins trailing controls right)", () => {
+  it("keeps exactly one ml-auto in the strip with open tabs (trailing group pins right)", () => {
     // The nav tabs stay anchored on the LEFT with open tabs — the open-tabs
-    // region renders to their right and the panel picker keeps the row's
-    // single ml-auto. Two ml-auto siblings would split the free space.
+    // region renders to their right and the trailing control group keeps the
+    // row's single ml-auto. Two ml-auto siblings would split the free space.
     renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
     // The nav tablist stays left — no ml-auto of its own.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
-    // The panel picker owns the single ml-auto, pinning the controls right.
-    expect(screen.getByRole("button", { name: "Select panel" }).parentElement).toHaveClass(
-      "ml-auto",
-    );
+    // The trailing control group owns the single ml-auto, pinning it right.
+    expect(screen.getByRole("button", { name: "Select panel" }).closest(".ml-auto")).not.toBeNull();
     // The divider is present (separating the nav tabs from the open tabs) and
     // stays container-query gated to the ≥500px anchored case.
     const divider = strip().querySelector(".bg-border-strong");
@@ -1004,8 +1003,8 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     renderWorkspace({ openFiles: ["src/App.tsx"] });
 
     const plus = screen.getByRole("button", { name: "Open new" });
-    // Scroller is the "+" wrapper's preceding sibling; it holds only the tabs.
-    const tabsRegion = plus.parentElement!.previousElementSibling as HTMLElement;
+    // Scroller precedes the trailing group holding "+"; it holds only the tabs.
+    const tabsRegion = plus.closest(".ml-auto")!.previousElementSibling as HTMLElement;
     expect(tabsRegion.children).toHaveLength(1);
     expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
   });
