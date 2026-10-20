@@ -89,6 +89,24 @@ def test_exec_launcher_accepts_dedicated_scratch_directory(
         path.unlink()
 
 
+def test_exec_launcher_freezes_phoenix_proc_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filtered child launcher does not need the Phoenix marker."""
+    captured: list[SandboxPolicy] = []
+    policy = dataclasses.replace(_noop_policy(), active=True, backend_type="linux_bwrap")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
+    monkeypatch.setattr(
+        "omnigent.inner.sandbox._launcher_inline_source",
+        lambda _target, resolved, *, cwd=None: captured.append(resolved) or "pass",
+    )
+
+    path = pathlib.Path(create_exec_launcher(sys.executable, policy))
+    path.unlink()
+
+    assert captured[0].bind_host_proc is True
+
+
 def test_run_launcher_emits_logger_checkpoints(caplog) -> None:
     """
     ``run_launcher`` logs three INFO records around the
@@ -289,10 +307,13 @@ def test_sandbox_policy_round_trips_spawn_env_allowlist() -> None:
     """
     policy = _noop_policy()
     policy.spawn_env_allowlist = ["HOME", "PATH", "PI_CODING_AGENT_DIR"]
+    policy.bind_host_proc = True
 
     decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
 
     assert decoded.spawn_env_allowlist == ["HOME", "PATH", "PI_CODING_AGENT_DIR"]
+    assert decoded.bind_host_proc is True
+    assert SandboxPolicy.from_jsonable({}).bind_host_proc is None
     # Old payloads (no key) and unset policies must decode to None —
     # "no prune", not "prune everything".
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).spawn_env_allowlist is None
@@ -489,9 +510,6 @@ def test_run_launcher_keeps_resolved_proc_bind_after_env_pruning(
     monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
     monkeypatch.setattr(
         "omnigent.inner.bwrap_sandbox.shutil.which", lambda _name: "/usr/bin/bwrap"
-    )
-    monkeypatch.setattr(
-        "omnigent.inner.bwrap_sandbox._LAKEBOX_MARKER", tmp_path / "no-lakebox-marker"
     )
     policy = BwrapSandboxBackend().resolve(
         OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),

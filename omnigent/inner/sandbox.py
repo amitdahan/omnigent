@@ -129,8 +129,8 @@ class SandboxPolicy:
         environment cannot leak it into the sandbox.
         ``None`` (the default) skips the prune for spawn sites that
         haven't opted in.
-    :param bind_host_proc: Parent-side bwrap choice, resolved on the process
-        that builds the launcher. ``None`` means it has not been resolved yet.
+    :param bind_host_proc: Launcher-local bwrap choice. ``None`` means the
+        process constructing the final launcher has not resolved it yet.
     :param egress_relay_port: TCP port the in-namespace relay listens
         on (loopback). Set when ``egress_rules`` is active; the helper
         starts a relay daemon on this port at activation time. C1
@@ -189,8 +189,7 @@ class SandboxPolicy:
     mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
-    # Parent-side only: host-dependent state must not cross the policy wire
-    # from another machine.
+    # Resolved only at the final direct wrap or exec-launcher construction.
     bind_host_proc: bool | None = None
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
@@ -256,6 +255,7 @@ class SandboxPolicy:
                 if self.spawn_env_allowlist is not None
                 else None
             ),
+            "bind_host_proc": self.bind_host_proc,
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
             "git_ssh_socket_path": self.git_ssh_socket_path,
@@ -299,6 +299,8 @@ class SandboxPolicy:
         overflow = overflow_raw if isinstance(overflow_raw, str) else "warn"
         recursive_raw = data.get("cwd_hidden_scan_recursive", False)
         recursive = recursive_raw if isinstance(recursive_raw, bool) else False
+        bind_host_proc_raw = data.get("bind_host_proc")
+        bind_host_proc = bind_host_proc_raw if isinstance(bind_host_proc_raw, bool) else None
         mask_paths_data = data.get("mask_paths")
         mask_paths: list[Path] | None = None
         if isinstance(mask_paths_data, list):
@@ -358,6 +360,7 @@ class SandboxPolicy:
             mask_paths=mask_paths,
             env_passthrough=env_passthrough,
             spawn_env_allowlist=spawn_env_allowlist,
+            bind_host_proc=bind_host_proc,
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
             git_ssh_socket_path=git_ssh_socket_path,
@@ -1118,10 +1121,14 @@ def run_launcher(
     # broker dirs before bwrap scans dotfiles and hides their sockets.
     sandbox = _restore_broker_socket_roots(SandboxPolicy.from_jsonable(decoded))
 
-    backend: SandboxBackend | None = None
-    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
-        backend = get_backend(sandbox.backend_type)
-        sandbox = backend.prepare_launcher_policy(sandbox)
+    # Older launcher payloads may not have frozen host-local choices. Resolve
+    # them only on the host-side pass; the re-encoded policy carries the result.
+    if (
+        sandbox.active
+        and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
+        and os.environ.get(_LAUNCHER_WRAPPED_ENV) != "1"
+    ):
+        sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
 
     # The host marker is launcher-only and must never reach the target.
     os.environ.pop(HOST_SANDBOX_BACKEND_ENV, None)
@@ -1142,7 +1149,7 @@ def run_launcher(
     #
     # We re-exec self under ``backend.wrap_launcher_argv``. The
     # wrapped invocation re-enters this function (via the launcher
-    # script's ``__main__``) but the marker env var breaks the loop
+    # script's ``__main__``) but ``_LAUNCHER_WRAPPED_ENV`` breaks the loop
     # and we proceed to the in-process ``activate_sandbox`` +
     # ``subprocess.run`` path. The wrap inherits HTTP_PROXY / CA
     # env vars set by the parent (terminal path) so the relay
@@ -1152,7 +1159,7 @@ def run_launcher(
         and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
         and os.environ.get(_LAUNCHER_WRAPPED_ENV) != "1"
     ):
-        assert backend is not None
+        backend = get_backend(sandbox.backend_type)
         # Mint the private scratch tmpdir HERE, on the host, before the
         # wrap is built — the reference pattern from
         # ``_HelperProcessClient._start_locked``. The wrap bakes the
@@ -1323,6 +1330,10 @@ def create_exec_launcher(
                     f"Sandbox write grant {root} exposes the host launcher directory. "
                     "Grant a dedicated scratch directory instead of the host temporary root."
                 )
+        if sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+            # Path-based spawners may filter the launcher environment. Freeze
+            # host-local choices here, immediately before encoding the policy.
+            sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
     inline = _launcher_inline_source(target_path, sandbox, cwd=cwd)
     interpreter = sys.executable
     if not interpreter:

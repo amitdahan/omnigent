@@ -1138,16 +1138,22 @@ def test_wrap_launcher_argv_fresh_proc_by_default(
     assert not _has_pair(argv, "--bind", "/proc", "/proc")
 
 
-def test_wrap_launcher_argv_binds_proc_when_resolved(tmp_path: Path) -> None:
-    """
-    A resolved proc-bind decision replaces the fresh procfs mount.
-    """
+@pytest.mark.parametrize(("frozen", "expected_bind"), [(None, True), (False, False)])
+def test_wrap_launcher_argv_respects_proc_choice_on_phoenix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    frozen: bool | None,
+    expected_bind: bool,
+) -> None:
+    """A frozen choice wins over Phoenix detection."""
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
     backend = _make_backend()
     policy = _make_policy(tmp_path)
-    policy.bind_host_proc = True
+    policy.bind_host_proc = frozen
     argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
-    assert _has_pair(argv, "--bind", "/proc", "/proc")
-    assert not _has_pair_single_dest(argv, "--proc", "/proc")
+    assert _has_pair(argv, "--bind", "/proc", "/proc") is expected_bind
+    assert _has_pair_single_dest(argv, "--proc", "/proc") is not expected_bind
     assert _has_pair_single_dest(argv, "--dev", "/dev")
     assert "--tmpfs" in argv
 
