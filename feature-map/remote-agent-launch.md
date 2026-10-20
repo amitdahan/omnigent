@@ -74,9 +74,13 @@ coverage requires `pexpect`; a skipped variant is not proof.
   auth and host sharding. The interactive startup matrix checks creation and
   later session reads without bearer auth. These use mocked HTTP, not a live
   sharded deployment.
+  `tests/cli/test_chat.py::test_one_shot_stops_the_launched_runner_on_failure`
+  covers turn errors, turn interrupts, and session-ready callback interrupts.
 - `existing-session`: `tests/cli/test_chat.py` covers source-session lookup,
   missing resume harnesses, and fork independence from a failing or ambiguous
   catalog. `tests/cli/test_cli.py` covers early rejection of fork with `-p`.
+  `tests/cli/test_chat.py::test_resume_one_shot_uses_the_sessions_harness_or_agent`
+  covers a valid session harness and missing or malformed harness fallbacks.
   These regressions are component checks, not a complete process-level fork or
   resume journey.
 - `errors`: `tests/cli/test_chat.py` and
