@@ -1050,26 +1050,29 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const queryClient = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
   const refreshButton = (
-    <Button
-      size="sm"
-      variant="ghost"
-      disabled={refreshing}
-      onClick={async () => {
-        setRefreshing(true);
-        try {
-          await Promise.all(
-            ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
-              queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
-            ),
-          );
-        } finally {
-          setRefreshing(false);
-        }
-      }}
-    >
-      <RefreshCwIcon className={cn("size-3.5", refreshing && "animate-spin")} />
-      Refresh
-    </Button>
+    <TooltipProvider delayDuration={0}>
+      <IconButton
+        label="Refresh"
+        disabled={refreshing}
+        onClick={async () => {
+          setRefreshing(true);
+          try {
+            await Promise.all(
+              ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
+                queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
+              ),
+            );
+          } finally {
+            setRefreshing(false);
+          }
+        }}
+      >
+        <RefreshCwIcon
+          className={cn("size-3.5", refreshing && "animate-spin")}
+          aria-hidden="true"
+        />
+      </IconButton>
+    </TooltipProvider>
   );
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
