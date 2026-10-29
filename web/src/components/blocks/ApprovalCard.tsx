@@ -33,7 +33,7 @@
 //   3. rolls back to "pending" on network error.
 
 import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
-import { useContext } from "react";
+import { useContext, useMemo } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -54,6 +54,7 @@ import {
   exitPlanModePlan,
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
+import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
@@ -211,6 +212,8 @@ interface ApprovalCardProps {
    * automatically. Absent/false where the switch was never offered.
    */
   allowAutoMode?: boolean;
+  /** Exact native directory scope offered for the rest of this session. */
+  permissionDirectories?: string[];
   /**
    * Claude-native non-edit tool prompts only: when set, the binary
    * approve/reject card also offers an "Approve & don't ask again for
@@ -257,6 +260,7 @@ export function ApprovalCard({
   codexCommand,
   allowAllEdits,
   allowAutoMode,
+  permissionDirectories,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   agyPermission,
@@ -347,8 +351,16 @@ export function ApprovalCard({
   // (full, non-truncated); fall back to parsing the content_preview
   // JSON for backwards compatibility with elicitations published
   // before the structured field was added.
-  const askPayload: AskUserQuestionPayload | null =
-    castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview);
+  const askPayload: AskUserQuestionPayload | null = useMemo(
+    () =>
+      castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview),
+    [askUserQuestion, contentPreview],
+  );
+  // Remount the question form when the same elicitation carries new questions.
+  const askQuestionsKey = useMemo(
+    () => (askPayload ? askUserQuestionSignature(askPayload.questions) : ""),
+    [askPayload],
+  );
   // ExitPlanMode plan review: the server stamps the full tool_input
   // as `exit_plan_mode`; a usable plan card needs the `plan` markdown
   // string. Anything else falls back to the binary card.
@@ -387,7 +399,9 @@ export function ApprovalCard({
         ? "Codex needs input"
         : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
           ? "Cursor has questions"
-          : "Claude has questions";
+          : policyName.startsWith("pi_") || phase.startsWith("pi_")
+            ? "Pi needs your input"
+            : "Claude has questions";
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
@@ -408,6 +422,23 @@ export function ApprovalCard({
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
   const acceptedAutoMode =
     response?.action === "accept" && response.content?.allow_auto_mode === true;
+  const hasPermissionDirectories = Boolean(permissionDirectories?.length);
+  const acceptedDirectories =
+    hasPermissionDirectories &&
+    response?.action === "accept" &&
+    response.content?.allow_directories === true;
+  const directoryScope = hasPermissionDirectories ? (
+    <div className="flex flex-col gap-1 text-sm">
+      <span>{acceptedDirectories ? "Allowed directories:" : "Requested directory access:"}</span>
+      <ul className="flex flex-col gap-1">
+        {permissionDirectories!.map((directory) => (
+          <li key={directory}>
+            <code className="font-mono whitespace-pre-wrap break-all">{directory}</code>
+          </li>
+        ))}
+      </ul>
+    </div>
+  ) : null;
   const acceptedRemember = response?.content?.remember === true;
   const acceptedPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
@@ -489,7 +520,19 @@ export function ApprovalCard({
           Always allow
         </Button>
       )}
-      {allowAutoMode && (
+      {hasPermissionDirectories && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-auto min-h-8 whitespace-normal text-left"
+          onClick={() => submit(elicitationId, "accept", { allow_directories: true })}
+          componentId="approval.approve_directories"
+        >
+          <CheckIcon className="mr-1 size-3.5 shrink-0" />
+          Approve &amp; allow directories for this session
+        </Button>
+      )}
+      {!hasPermissionDirectories && allowAutoMode && (
         <Button
           size="sm"
           variant="outline"
@@ -501,7 +544,7 @@ export function ApprovalCard({
           Approve &amp; switch to auto mode
         </Button>
       )}
-      {allowAllEdits && (
+      {!hasPermissionDirectories && allowAllEdits && (
         <Button
           size="sm"
           variant="outline"
@@ -512,7 +555,7 @@ export function ApprovalCard({
           Accept & allow all edits
         </Button>
       )}
-      {rememberTarget && (
+      {!hasPermissionDirectories && rememberTarget && (
         <Button
           size="sm"
           variant="outline"
@@ -673,6 +716,9 @@ export function ApprovalCard({
     } else if (acceptedWithExecPolicy) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved and remembered";
+    } else if (acceptedDirectories) {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved · directory access for this session";
     } else if (acceptedAutoMode) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved · auto mode";
@@ -747,7 +793,7 @@ export function ApprovalCard({
               </>
             ) : showGatingMessage ? (
               <>
-                <ElicitationMessage message={message} />
+                <ElicitationMessage message={message} className="whitespace-pre-line" />
                 {agyPermission?.actionDescription && (
                   <span
                     className="text-sm text-muted-foreground"
@@ -758,6 +804,7 @@ export function ApprovalCard({
                 )}
               </>
             ) : null}
+            {acceptedDirectories && directoryScope}
             {submittedAnswers !== null && (
               <ul className="flex flex-col gap-0.5">
                 {Object.entries(submittedAnswers).map(([q, ans]) => (
@@ -831,6 +878,8 @@ export function ApprovalCard({
           </>
         ) : isAskUserQuestion ? (
           <AskUserQuestionForm
+            key={`${elicitationId}:${askQuestionsKey}`}
+            elicitationId={elicitationId}
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
@@ -852,7 +901,7 @@ export function ApprovalCard({
           </>
         ) : (
           <>
-            <ElicitationMessage message={message} />
+            <ElicitationMessage message={message} className="whitespace-pre-line" />
             {agyPermission?.actionDescription && (
               <span className="text-sm text-muted-foreground" data-testid="agy-action-description">
                 {agyPermission.actionDescription}
@@ -869,6 +918,7 @@ export function ApprovalCard({
                 {formattedPreview}
               </pre>
             )}
+            {directoryScope}
             {isExternalUrl ? (
               <div className="flex flex-wrap gap-2 pt-1">
                 <Button size="sm" asChild>
@@ -945,6 +995,7 @@ export function ElicitationCard({
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       allowAutoMode={item.allowAutoMode}
+      permissionDirectories={item.permissionDirectories}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
       agyPermission={item.agyPermission}
